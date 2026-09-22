@@ -12,7 +12,7 @@ Pelayo, Agatha Fei · Narciso, Frank Exequiel · Gomugda, Kyle Joniel
 
 | # | Objective | Owner(s) | Status |
 |---|---|---|---|
-| 1 | Event Ingestion & Partitioning | | ✅ Done — see `data-ingestion/` |
+| 1 | Event Ingestion & Partitioning | | Done — see `data-ingestion/` |
 | 2 | Real-Time Stream Processing & Detection | | ⬜ Not started |
 | 3 | Distributed Persistence & Alerting | | ⬜ Not started |
 | 4 | Pipeline Integration & Evaluation | | ⬜ Not started |
