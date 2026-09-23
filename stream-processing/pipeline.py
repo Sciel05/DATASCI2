@@ -23,8 +23,12 @@ parsed = parsed.withColumn("timestamp", (F.col("event_time_ms") / 1000).cast("ti
 
 detection_input = parsed.drop("label")
 
-result = detect_anomalies(detection_input)
-output = result.select("ticker", "timestamp", "price", "volume", "zscore", "vwap_divergence", "is_anomaly", "anomaly_type")
+def process_batch(batch_df, batch_id):
+    if batch_df.isEmpty():
+        return
+    result = detect_anomalies(batch_df)
+    output = result.select("ticker", "timestamp", "price", "volume", "zscore", "vwap_divergence", "is_anomaly", "anomaly_type")
+    output.show(truncate=False)
 
-query = output.writeStream.format("console").outputMode("append").start()
+query = detection_input.writeStream.foreachBatch(process_batch).start()
 query.awaitTermination()
