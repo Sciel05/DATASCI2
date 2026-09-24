@@ -12,10 +12,10 @@ Pelayo, Agatha Fei · Narciso, Frank Exequiel · Gomugda, Kyle Joniel
 
 | # | Objective | Owner(s) | Status |
 |---|---|---|---|
-| 1 | Event Ingestion & Partitioning | | Done — see `data-ingestion/` |
-| 2 | Real-Time Stream Processing & Detection | | ⬜ Not started |
-| 3 | Distributed Persistence & Alerting | | ⬜ Not started |
-| 4 | Pipeline Integration & Evaluation | | ⬜ Not started |
+| 1 | Event Ingestion & Partitioning | Pelayo, Agatha Fei | Done — see `data-ingestion/` |
+| 2 | Real-Time Stream Processing & Detection | Narciso, Frank Exequiel | In progress — see `stream-processing/` |
+| 3 | Distributed Persistence & Alerting | Villanueva, Hector Angelo & Gomugda, Kyle Joniel | In progress / Implemented — see `persistence/` |
+| 4 | Pipeline Integration & Evaluation | Catacutan, Elijah | Pending integration — see `evaluation/` |
 
 ## Repo structure
 
@@ -23,13 +23,14 @@ Pelayo, Agatha Fei · Narciso, Frank Exequiel · Gomugda, Kyle Joniel
 market-surveillance-pipeline/
 ├── data-ingestion/       # Objective 1 — Kafka producer, dataset, partitioning
 ├── stream-processing/    # Objective 2 — Spark Structured Streaming, Z-score/VWAP detection
-├── persistence/          # Objective 3 — Cassandra schema, sink, dashboard
+├── persistence/          # Objective 3 — Cassandra schema, sink, alerting daemon & dashboard
 └── evaluation/           # Objective 4 — latency/throughput results, integration
 ```
 
-(Only `data-ingestion/` has working code so far — `stream-processing/`,
-`persistence/`, and `evaluation/` each have a README describing what
-that objective needs to build; add code there as you pick it up.)
+- `data-ingestion/`: Working Kafka producer with synthetic & labeled market tick generation.
+- `stream-processing/`: Spark Structured Streaming detection pipeline (Z-score, VWAP divergence).
+- `persistence/`: Apache Cassandra schema + streaming sinks (`cassandra_sink.py`), plus real-time alerting engine (`alerting/`), background daemon (`run_alerting.py`), and Streamlit financial surveillance desk (`dashboard/app.py`).
+- `evaluation/`: End-to-end evaluation metrics (precision, recall, latency).
 
 ## Architecture
 
@@ -38,15 +39,22 @@ that objective needs to build; add code there as you pick it up.)
         -> [Kafka: market-ticks topic, partitioned by ticker]
         -> [Spark Structured Streaming: per-ticker rolling Z-score / VWAP]
         -> [Cassandra: raw_events + anomalies tables]
-        -> [Dashboard: polls anomalies table]
+        -> [Alerting Daemon + Streamlit Surveillance Dashboard]
 ```
 
 Each stage's own README (inside its folder) has the actual setup and run
-instructions. Start with `data-ingestion/README.md`.
+instructions. Start with `data-ingestion/README.md` or `persistence/README.md`.
 
 ## Getting started
 
 1. Clone the repo.
-2. Pick your objective's folder, read its README.
-3. `data-ingestion/` already produces a live `market-ticks` Kafka topic —
-   point your Spark job at it once Objective 1 is running locally.
+2. Install dependencies for your module (e.g. `pip install -r persistence/requirements.txt`).
+3. Run the Streamlit surveillance dashboard:
+   ```bash
+   streamlit run persistence/dashboard/app.py
+   ```
+4. Run the alerting daemon:
+   ```bash
+   python persistence/run_alerting.py
+   ```
+
