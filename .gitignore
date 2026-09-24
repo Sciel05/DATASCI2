@@ -11,3 +11,6 @@ venv/
 spark-warehouse/
 checkpoint/
 *.log
+
+# Temporary offline Python packages used for Docker testing
+persistence/wheelhouse/
