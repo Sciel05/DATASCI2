@@ -156,6 +156,7 @@ def raw_scores(df, window, min_samples, wash=(0.3, 0.001)):
         ewma_threshold=float("inf"),
         cusum_h=float("inf"),
         cusum_volume_h=float("inf"),
+        volume_spike_multiple=0.0,
     )
     fn = make_baseline_update_fn(**kwargs)
     parts = []
