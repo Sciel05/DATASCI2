@@ -51,7 +51,7 @@ KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0"
 DEFAULT_SPARK_SUBMIT = "/usr/local/lib/python3.10/dist-packages/pyspark/bin/spark-submit"
 
 # output fields compared, beyond the (ticker, timestamp) join key
-FLOAT_FIELDS = ["price", "volume", "zscore", "vwap_divergence"]
+FLOAT_FIELDS = ["price", "volume", "zscore", "vwap_divergence", "ewma_divergence"]
 EXACT_FIELDS = ["is_anomaly", "anomaly_type"]
 
 
@@ -159,6 +159,13 @@ def compare_frames(offline, spark):
 
     counts, examples = {}, {}
     for name in FLOAT_FIELDS + EXACT_FIELDS:
+        in_off, in_spk = name in offline.columns, name in spark.columns
+        if not (in_off or in_spk):
+            continue  # a field neither side has (e.g. an older output schema)
+        if in_off != in_spk:
+            problems.append(f"field {name} only in {'offline' if in_off else 'spark'} output")
+            counts[name] = len(both)
+            continue
         off, spk = both[f"{name}_off"], both[f"{name}_spk"]
         if name in FLOAT_FIELDS:
             bad = ~close(off, spk)

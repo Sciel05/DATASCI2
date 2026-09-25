@@ -85,3 +85,11 @@ def test_parse_spark_rows_reads_kafka_json_values():
     assert list(out["ts_ms"]) == [1789565400018, 1789565401000]
     assert np.isnan(out.loc[0, "zscore"])  # omitted null field
     assert out.loc[1, "anomaly_type"] == "price_shock"
+
+
+def test_field_missing_from_one_side_is_a_mismatch():
+    off = offline_frame().assign(ewma_divergence=[np.nan, np.nan, 0.1, 0.2, 0.3])
+    spk = offline_frame()  # e.g. the sink dropped the new field
+    problems, counts, _, _ = compare_frames(off, spk)
+    assert any("ewma_divergence only in offline" in p for p in problems)
+    assert counts["ewma_divergence"] == 5

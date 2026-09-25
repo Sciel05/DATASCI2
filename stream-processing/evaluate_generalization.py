@@ -152,6 +152,8 @@ def raw_scores(df, window, min_samples, wash=(0.3, 0.001)):
         clip_k=CLIP_K,
         wash_volume_ratio=wash[0],
         wash_price_range=wash[1],
+        # sections 1-3 study the z-score and original wash components only
+        ewma_threshold=float("inf"),
     )
     fn = make_baseline_update_fn(**kwargs)
     parts = []

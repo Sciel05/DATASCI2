@@ -27,6 +27,12 @@ across micro-batches rather than restarting cold at every batch boundary:
    README, not a validated detector. Flags anomaly_type="wash_trade"
    (price_shock takes precedence if both fire on the same tick).
 
+3. Ramp signal (EWMA divergence): a fast EWMA of price (--ewma-fast-span)
+   against a slow one (--ewma-slow-span), normalized by the divergence's
+   own recent RMS. A price walked up or down over many ticks pulls the
+   fast average away from the slow one before any single tick looks
+   extreme. Flags anomaly_type="price_shock" (the price-anomaly family).
+
 Both detectors start cold after a gap longer than --gap-reset-minutes
 (overnight/weekend), so the morning open isn't scored against yesterday's
 close. A tick older than one already processed for its ticker (i.e. it
@@ -95,8 +101,11 @@ OUTPUT_SCHEMA = StructType(
         StructField("vwap_divergence", DoubleType(), True),
         StructField("is_anomaly", BooleanType()),
         StructField("anomaly_type", StringType(), True),
+        # --- added fields (appended; the ones above are unchanged)
+        StructField("ewma_divergence", DoubleType(), True),
     ]
 )
+OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
 
 
 # A single opaque blob rather than one StructField per piece of state: PySpark
@@ -128,6 +137,12 @@ def empty_state():
         "wash_hist": [],
         "last_ts": None,
         "late_dropped": 0,
+        # EWMA ramp signal: fast/slow price averages, mean square of their
+        # divergence, and ticks seen since the last reset
+        "ewma_fast": None,
+        "ewma_slow": None,
+        "ewma_div_ms": 0.0,
+        "ewma_n": 0,
     }
 
 
@@ -157,17 +172,27 @@ def make_baseline_update_fn(
     wash_price_range=0.001,
     wash_min_prior=4,
     gap_reset_ms=30 * 60 * 1000,
+    ewma_fast_span=3,
+    ewma_slow_span=20,
+    ewma_threshold=2.75,
+    ewma_min_samples=50,
 ):
     """Builds the per-ticker flatMapGroupsWithState function (PySpark:
     applyInPandasWithState). Closes over the tuned thresholds so they don't
     need to be threaded through Spark's fixed (key, pdf_iter, state) signature.
     """
+    alpha_fast = 2.0 / (ewma_fast_span + 1)
+    alpha_slow = 2.0 / (ewma_slow_span + 1)
+    # the divergence's RMS adapts at half the slow average's speed
+    alpha_div = 2.0 / (2 * ewma_slow_span + 1)
 
     def update_baseline(key, pdf_iter, state: GroupState):
         st = load_state(state)
         window, wash_hist = st["window"], st["wash_hist"]
         sum_price, sum_sq, sum_pv, sum_v = st["sum_price"], st["sum_sq"], st["sum_pv"], st["sum_v"]
         last_ts, late_dropped = st["last_ts"], st["late_dropped"]
+        ewma_fast, ewma_slow = st["ewma_fast"], st["ewma_slow"]
+        ewma_div_ms, ewma_n = st["ewma_div_ms"], st["ewma_n"]
         batch_late = 0
 
         rows_out = []
@@ -187,7 +212,26 @@ def make_baseline_update_fn(
                     # detectors start cold and re-warm.
                     window, wash_hist = [], []
                     sum_price = sum_sq = sum_pv = sum_v = 0.0
+                    ewma_fast = ewma_slow = None
+                    ewma_div_ms, ewma_n = 0.0, 0
                 last_ts = row.event_time_ms
+
+                # Ramp signal: fast EWMA (including this tick) minus the slow
+                # EWMA as of the previous tick, scaled by the divergence's RMS
+                # before this tick -- so a ramp is judged against how far the
+                # two averages normally drift apart for this ticker.
+                ewma_div = None
+                if ewma_fast is None:
+                    ewma_fast = ewma_slow = row.price
+                else:
+                    ewma_fast += alpha_fast * (row.price - ewma_fast)
+                    divergence = ewma_fast - ewma_slow
+                    if ewma_n >= ewma_min_samples and ewma_div_ms > 0:
+                        ewma_div = divergence / ewma_div_ms**0.5
+                    ewma_div_ms += alpha_div * (divergence * divergence - ewma_div_ms)
+                    ewma_slow += alpha_slow * (row.price - ewma_slow)
+                ewma_n += 1
+                is_ramp = ewma_div is not None and abs(ewma_div) > ewma_threshold
 
                 # Wash-trade heuristic, scored against ticks strictly before
                 # this one within the lookback (same-millisecond ticks are
@@ -262,6 +306,10 @@ def make_baseline_update_fn(
                     zscore, vwap_div, is_anomaly, anomaly_type = None, None, False, None
                     clipped_price = row.price
 
+                # the ramp signal has its own warm-up (ewma_min_samples)
+                if is_ramp and not is_anomaly:
+                    is_anomaly, anomaly_type = True, "price_shock"
+
                 # independent of the baseline's warm-up; price_shock wins ties
                 if is_wash_trade and not is_anomaly:
                     is_anomaly, anomaly_type = True, "wash_trade"
@@ -276,6 +324,7 @@ def make_baseline_update_fn(
                         vwap_div,
                         is_anomaly,
                         anomaly_type,
+                        ewma_div,
                     )
                 )
 
@@ -317,24 +366,16 @@ def make_baseline_update_fn(
                         "wash_hist": wash_hist,
                         "last_ts": last_ts,
                         "late_dropped": late_dropped,
+                        "ewma_fast": ewma_fast,
+                        "ewma_slow": ewma_slow,
+                        "ewma_div_ms": ewma_div_ms,
+                        "ewma_n": ewma_n,
                     }
                 ),
             )
         )
 
-        yield pd.DataFrame(
-            rows_out,
-            columns=[
-                "ticker",
-                "timestamp",
-                "price",
-                "volume",
-                "zscore",
-                "vwap_divergence",
-                "is_anomaly",
-                "anomaly_type",
-            ],
-        )
+        yield pd.DataFrame(rows_out, columns=OUTPUT_COLUMNS)
 
     return update_baseline
 
@@ -354,6 +395,10 @@ def detector_kwargs(args):
         wash_price_range=args.wash_price_range,
         wash_min_prior=args.wash_min_prior,
         gap_reset_ms=int(args.gap_reset_minutes * 60 * 1000),
+        ewma_fast_span=args.ewma_fast_span,
+        ewma_slow_span=args.ewma_slow_span,
+        ewma_threshold=args.ewma_threshold,
+        ewma_min_samples=args.ewma_min_samples,
     )
 
 
@@ -404,18 +449,7 @@ def build_sink(anomaly_df, args, name):
         sink = (
             anomaly_df.select(
                 F.col("ticker").alias("key"),
-                F.to_json(
-                    F.struct(
-                        "ticker",
-                        "timestamp",
-                        "price",
-                        "volume",
-                        "zscore",
-                        "vwap_divergence",
-                        "is_anomaly",
-                        "anomaly_type",
-                    )
-                ).alias("value"),
+                F.to_json(F.struct(*OUTPUT_COLUMNS)).alias("value"),
             )
             .writeStream.format("kafka")
             .option("kafka.bootstrap.servers", args.bootstrap_servers)
@@ -538,6 +572,16 @@ def parse_args(argv=None):
         help="Minimum prior ticks in the lookback before the wash-trade check applies, "
         "so the first few ticks after a quiet gap can't trivially exceed the volume ratio",
     )
+
+    # ramp signal (EWMA divergence)
+    ap.add_argument("--ewma-fast-span", type=float, default=3.0,
+                    help="Span (ticks) of the fast price EWMA for the ramp signal")
+    ap.add_argument("--ewma-slow-span", type=float, default=20.0,
+                    help="Span (ticks) of the slow price EWMA for the ramp signal")
+    ap.add_argument("--ewma-threshold", type=float, default=2.75,
+                    help="Flag when |fast - slow| exceeds this many RMS of the recent divergence")
+    ap.add_argument("--ewma-min-samples", type=int, default=50,
+                    help="Ticks since the last reset before the ramp signal is scored")
 
     # stream hygiene
     ap.add_argument(
