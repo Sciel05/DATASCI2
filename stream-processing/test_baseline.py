@@ -485,6 +485,74 @@ def test_gap_reset_also_resets_the_trading_rate():
     assert st["rate_dt_ms"] < 1000.0  # morning spacing only, no overnight gap
 
 
+# --- risk score and incidents
+
+
+def test_risk_score_is_the_largest_signal_over_its_alarm_level():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    specs = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(40)] + [(500.0, 100.0)]
+    out, _ = run(fn, make_ticks(specs))
+    last = out.iloc[-1]
+    expected = max(abs(last["zscore"]) / 5.0, last["vwap_divergence"] / 0.01)
+    assert last["risk_score"] == pytest.approx(expected)
+    assert last["signals"] == "zscore,vwap"
+    unflagged = out.iloc[:-1]
+    assert (unflagged["risk_score"] <= 1.0).all()
+    assert unflagged["signals"].isna().all()
+
+
+def test_raising_risk_threshold_scales_every_signal_together():
+    specs = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(40)] + [(100.45, 100.0)]
+    base = dict(window_size=20, min_samples=10, z_threshold=3.0, vwap_threshold=0.01)
+    at_1, _ = run(make_baseline_update_fn(**base), make_ticks(specs))
+    at_2, _ = run(make_baseline_update_fn(**base, risk_threshold=2.0), make_ticks(specs))
+    z = abs(at_1.iloc[-1]["zscore"])
+    assert 3.0 < z < 6.0  # over the z threshold, under twice it
+    assert at_1.iloc[-1]["is_anomaly"] and not at_2.iloc[-1]["is_anomaly"]
+    assert at_1.iloc[-1]["risk_score"] == pytest.approx(at_2.iloc[-1]["risk_score"])
+
+
+def incident_fn(**kw):
+    return make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=1e9, ewma_threshold=1e9,
+        cusum_h=1e9, cusum_volume_h=1e9, wash_volume_ratio=1e9, **kw,
+    )
+
+
+def spiky(n, spikes):
+    """Alternating +/-0.1 around 100 with isolated big spikes at `spikes`."""
+    return [(150.0 if i in spikes else 100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(n)]
+
+
+def test_flags_within_the_gap_share_an_incident_and_a_longer_gap_starts_a_new_one():
+    out, _ = run(incident_fn(incident_gap_ticks=10), make_ticks(spiky(80, {30, 35, 60})))
+    flagged = out[out["is_anomaly"]]
+    assert list(flagged.index) == [30, 35, 60]
+    ids = flagged["incident_id"].tolist()
+    assert ids[0] == ids[1]  # 4 unflagged ticks apart
+    assert ids[2] != ids[0]  # 24 unflagged ticks apart
+    assert ids[0] == f"AAPL-{int(out.loc[30, 'timestamp'].value // 1_000_000)}"
+    assert out[~out["is_anomaly"]]["incident_id"].isna().all()
+
+
+def test_incident_continues_across_micro_batches():
+    ticks = make_ticks(spiky(80, {30, 35}))
+    out1, state = run(incident_fn(), ticks.iloc[:33])
+    out2, _ = run(incident_fn(), ticks.iloc[33:].reset_index(drop=True), state=state)
+    first = out1[out1["is_anomaly"]]["incident_id"].iloc[0]
+    assert out2[out2["is_anomaly"]]["incident_id"].tolist() == [first]
+
+
+def test_gap_reset_closes_the_open_incident():
+    close_ms = 1_700_000_000_000
+    close = make_ticks(spiky(35, {30}), start_ms=close_ms)
+    _, state = run(incident_fn(), close)
+    assert load_state(state)["incident_id"] is not None
+    open_ms = close_ms + 35_000 + int(17.5 * 3600 * 1000)
+    _, state = run(incident_fn(), make_ticks(spiky(3, set()), start_ms=open_ms), state=state)
+    assert load_state(state)["incident_id"] is None
+
+
 def test_checkpoint_path_includes_state_layout_version():
     path = checkpoint_path("./checkpoints/detect_anomalies/", "baseline")
     assert path == f"./checkpoints/detect_anomalies/state-v{STATE_LAYOUT_VERSION}/baseline"

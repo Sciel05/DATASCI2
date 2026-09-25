@@ -51,8 +51,10 @@ KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0"
 DEFAULT_SPARK_SUBMIT = "/usr/local/lib/python3.10/dist-packages/pyspark/bin/spark-submit"
 
 # output fields compared, beyond the (ticker, timestamp) join key
-FLOAT_FIELDS = ["price", "volume", "zscore", "vwap_divergence", "ewma_divergence", "cusum_price", "cusum_volume"]
-EXACT_FIELDS = ["is_anomaly", "anomaly_type"]
+FLOAT_FIELDS = [
+    "price", "volume", "zscore", "vwap_divergence", "ewma_divergence", "cusum_price", "cusum_volume", "risk_score",
+]
+EXACT_FIELDS = ["is_anomaly", "anomaly_type", "signals", "incident_id"]
 
 
 class FakeState:

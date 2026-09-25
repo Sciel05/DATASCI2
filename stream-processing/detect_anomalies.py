@@ -46,6 +46,15 @@ across micro-batches rather than restarting cold at every batch boundary:
    market add up (wash trades split into normal-sized pieces). Price
    CUSUM flags "price_shock", volume CUSUM "wash_trade".
 
+Risk score and incidents: every signal is expressed as a multiple of its
+own alarm level (|z| / --zscore-threshold, CUSUM / h, tick volume / the
+wash rule's volume limit, ...) and risk_score is the largest of them. A
+tick is flagged when risk_score > --risk-threshold (1.0 = each signal at
+its own threshold); `signals` lists the ones above it. anomaly_type is
+"price_shock" if any price signal fired, else "wash_trade". Consecutive
+flags on a ticker at most --incident-gap-ticks unflagged ticks apart
+share an incident_id ("<ticker>-<first flag's event_time_ms>").
+
 Both detectors start cold after a gap longer than --gap-reset-minutes
 (overnight/weekend), so the morning open isn't scored against yesterday's
 close. A tick older than one already processed for its ticker (i.e. it
@@ -119,6 +128,9 @@ OUTPUT_SCHEMA = StructType(
         StructField("ewma_divergence", DoubleType(), True),
         StructField("cusum_price", DoubleType(), True),
         StructField("cusum_volume", DoubleType(), True),
+        StructField("risk_score", DoubleType(), True),
+        StructField("signals", StringType(), True),
+        StructField("incident_id", StringType(), True),
     ]
 )
 OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
@@ -138,7 +150,8 @@ OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
 # the job then starts from a fresh checkpoint directory instead of failing
 # on the old one. v1: pickled blob only. v2: blob + typed CUSUM fields.
 # v3: typical time between ticks (rate_dt_ms, rate_n) in the blob.
-STATE_LAYOUT_VERSION = 3
+# v4: open incident (incident_id, ticks_since_flag) in the blob.
+STATE_LAYOUT_VERSION = 4
 #
 # CUSUM state is kept as plain typed fields next to the blob (scalars only,
 # so the ArrayType problem above doesn't apply).
@@ -186,6 +199,9 @@ def empty_state():
         # typical time between ticks (slow EWMA, ms) for the wash lookback
         "rate_dt_ms": 0.0,
         "rate_n": 0,
+        # open incident: its id and unflagged ticks since its last flag
+        "incident_id": None,
+        "ticks_since_flag": 0,
         **empty_cusum_state(),
     }
 
@@ -246,6 +262,8 @@ def make_baseline_update_fn(
     cusum_volume_h=3.0,
     cusum_sigma_span=100,
     cusum_min_samples=50,
+    risk_threshold=1.0,
+    incident_gap_ticks=10,
 ):
     """Builds the per-ticker flatMapGroupsWithState function (PySpark:
     applyInPandasWithState). Closes over the tuned thresholds so they don't
@@ -266,6 +284,7 @@ def make_baseline_update_fn(
         ewma_fast, ewma_slow = st["ewma_fast"], st["ewma_slow"]
         ewma_div_ms, ewma_n = st["ewma_div_ms"], st["ewma_n"]
         rate_dt_ms, rate_n = st["rate_dt_ms"], st["rate_n"]
+        incident_id, ticks_since_flag = st["incident_id"], st["ticks_since_flag"]
         cusum_up, cusum_down, cusum_vol = st["cusum_up"], st["cusum_down"], st["cusum_vol"]
         cusum_prev_price, cusum_diff_ms = st["cusum_prev_price"], st["cusum_diff_ms"]
         cusum_logv_mean, cusum_logv_var, cusum_n = st["cusum_logv_mean"], st["cusum_logv_var"], st["cusum_n"]
@@ -297,6 +316,7 @@ def make_baseline_update_fn(
                     cusum_n = 0
                     rate_dt_ms, rate_n = 0.0, 0
                     prev_ts = None
+                    incident_id, ticks_since_flag = None, 0
                 last_ts = row.event_time_ms
 
                 # Typical time between ticks for this ticker. Pauses are
@@ -325,7 +345,6 @@ def make_baseline_update_fn(
                     ewma_div_ms += alpha_div * (divergence * divergence - ewma_div_ms)
                     ewma_slow += alpha_slow * (row.price - ewma_slow)
                 ewma_n += 1
-                is_ramp = ewma_div is not None and abs(ewma_div) > ewma_threshold
 
                 # Wash-trade heuristic, scored against ticks strictly before
                 # this one within the lookback (same-millisecond ticks are
@@ -334,7 +353,7 @@ def make_baseline_update_fn(
                 while wash_hist and wash_hist[0][0] < cutoff:
                     wash_hist.pop(0)
                 prior = [h for h in wash_hist if h[0] < row.event_time_ms]
-                is_wash_trade = False
+                wash_ratio = 0.0
                 flat_market = False
                 if prior:
                     lo_p = min(h[1] for h in prior)
@@ -342,16 +361,11 @@ def make_baseline_update_fn(
                 # wash_min_prior (carried over from the old windowed version's
                 # --wash-min-events): with only 1-3 prior ticks, any ordinary
                 # tick is trivially >30% of the trailing volume
-                if len(prior) >= max(wash_min_prior, 1):
+                if len(prior) >= max(wash_min_prior, 1) and flat_market:
                     prior_volume = sum(h[2] for h in prior)
-                    lo = min(h[1] for h in prior)
-                    hi = max(h[1] for h in prior)
-                    is_wash_trade = bool(
-                        prior_volume > 0
-                        and lo > 0
-                        and (hi - lo) / lo < wash_price_range
-                        and row.volume > wash_volume_ratio * prior_volume
-                    )
+                    if prior_volume > 0:
+                        # this tick's volume as a multiple of the rule's limit
+                        wash_ratio = row.volume / (wash_volume_ratio * prior_volume)
                 wash_hist.append((row.event_time_ms, row.price, row.volume))
 
                 # CUSUMs. Each standardized step is clipped to clip_k (one
@@ -388,8 +402,6 @@ def make_baseline_update_fn(
                 if cusum_warm:
                     cusum_price_out = max(cusum_up, cusum_down)
                     cusum_volume_out = cusum_vol
-                is_cusum_price = cusum_warm and cusum_price_out > cusum_h
-                is_cusum_volume = cusum_warm and cusum_volume_out > cusum_volume_h
 
                 n = len(window)
                 if n >= min_samples:
@@ -403,11 +415,6 @@ def make_baseline_update_fn(
                         if vwap is not None and vwap > 1e-9
                         else None
                     )
-                    is_anomaly = bool(
-                        abs(zscore) > z_threshold
-                        or (vwap_div is not None and vwap_div > vwap_threshold)
-                    )
-                    anomaly_type = "price_shock" if is_anomaly else None
 
                     # Bounded-influence update for the running mean/variance:
                     # clip this tick's deviation from the *current* mean to
@@ -438,16 +445,43 @@ def make_baseline_update_fn(
                 else:
                     # not enough trailing history yet to trust a baseline --
                     # emit the tick un-scored rather than guess
-                    zscore, vwap_div, is_anomaly, anomaly_type = None, None, False, None
+                    zscore, vwap_div = None, None
                     clipped_price = row.price
 
-                # the ramp signal has its own warm-up (ewma_min_samples)
-                if (is_ramp or is_cusum_price) and not is_anomaly:
-                    is_anomaly, anomaly_type = True, "price_shock"
+                # Risk: each signal as a multiple of its own alarm level (0
+                # while that signal is still warming up); risk_score is the
+                # largest. Price signals take precedence for anomaly_type.
+                price_scores = (
+                    ("zscore", abs(zscore) / z_threshold if zscore is not None else 0.0),
+                    ("vwap", vwap_div / vwap_threshold if vwap_div is not None else 0.0),
+                    ("ewma", abs(ewma_div) / ewma_threshold if ewma_div is not None else 0.0),
+                    ("cusum_price", cusum_price_out / cusum_h if cusum_price_out is not None else 0.0),
+                )
+                volume_scores = (
+                    ("wash_rule", wash_ratio),
+                    ("cusum_volume", cusum_volume_out / cusum_volume_h if cusum_volume_out is not None else 0.0),
+                )
+                risk_score = max(r for _name, r in price_scores + volume_scores)
+                fired = [name for name, r in price_scores + volume_scores if r > risk_threshold]
+                is_anomaly = bool(fired)
+                if any(r > risk_threshold for _name, r in price_scores):
+                    anomaly_type = "price_shock"
+                elif is_anomaly:
+                    anomaly_type = "wash_trade"
+                else:
+                    anomaly_type = None
+                signals = ",".join(fired) if fired else None
 
-                # independent of the baseline's warm-up; price_shock wins ties
-                if (is_wash_trade or is_cusum_volume) and not is_anomaly:
-                    is_anomaly, anomaly_type = True, "wash_trade"
+                # Incidents: consecutive flags at most incident_gap_ticks
+                # unflagged ticks apart share an id.
+                if is_anomaly:
+                    if incident_id is None or ticks_since_flag > incident_gap_ticks:
+                        incident_id = f"{row.ticker}-{int(row.event_time_ms)}"
+                    ticks_since_flag = 0
+                    tick_incident = incident_id
+                else:
+                    ticks_since_flag += 1
+                    tick_incident = None
 
                 rows_out.append(
                     (
@@ -462,6 +496,9 @@ def make_baseline_update_fn(
                         ewma_div,
                         cusum_price_out,
                         cusum_volume_out,
+                        float(risk_score),
+                        signals,
+                        tick_incident,
                     )
                 )
 
@@ -509,6 +546,8 @@ def make_baseline_update_fn(
                         "ewma_n": ewma_n,
                         "rate_dt_ms": rate_dt_ms,
                         "rate_n": rate_n,
+                        "incident_id": incident_id,
+                        "ticks_since_flag": ticks_since_flag,
                     }
                 ),
                 float(cusum_up),
@@ -554,6 +593,8 @@ def detector_kwargs(args):
         cusum_volume_h=args.cusum_volume_h,
         cusum_sigma_span=args.cusum_sigma_span,
         cusum_min_samples=args.cusum_min_samples,
+        risk_threshold=args.risk_threshold,
+        incident_gap_ticks=args.incident_gap_ticks,
     )
 
 
@@ -771,6 +812,12 @@ def parse_args(argv=None):
                     help="Span (ticks) of the slow tick-sigma and log-volume statistics")
     ap.add_argument("--cusum-min-samples", type=int, default=50,
                     help="Ticks since the last reset before the CUSUMs are scored")
+
+    # risk score and incidents
+    ap.add_argument("--risk-threshold", type=float, default=1.0,
+                    help="Flag when risk_score (largest signal / its own alarm level) exceeds this")
+    ap.add_argument("--incident-gap-ticks", type=int, default=10,
+                    help="Flags at most this many unflagged ticks apart share an incident_id")
 
     # stream hygiene
     ap.add_argument(

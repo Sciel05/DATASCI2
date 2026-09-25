@@ -411,6 +411,50 @@ def print_rows(title, rows):
         print(f"| {name:<44} | {flagged:>7} | {m['precision']:>9.2%} | {m['recall']:>7.2%} | {m['f1']:>6.3f} |")
 
 
+def trading_hours(df):
+    """Per ticker, total hours covered by its sessions (first to last tick
+    of each session, overnight gaps excluded)."""
+    sess = session_ids(df)
+    spans = df.groupby([df["ticker"], sess])["event_time_ms"].agg(["min", "max"])
+    return ((spans["max"] - spans["min"]) / 3_600_000).groupby(level=0).sum()
+
+
+def incident_metrics(df, out, events):
+    """Incident-level scores. An incident (flags sharing an incident_id) is
+    correct if any of its ticks falls inside any anomaly span; an event is
+    caught if any flagged tick falls inside its span. Returns overall
+    numbers and alerts (incidents) per trading hour per ticker."""
+    n = len(df)
+    cover = np.zeros(n, bool)
+    for s_, e_, _k in events:
+        cover[s_:e_] = True
+    inc = out["incident_id"].to_numpy()
+    flagged = pd.notna(inc)
+    ids = pd.Series(inc[flagged])
+    hit = pd.Series(cover[flagged]).groupby(ids.to_numpy()).any()
+    caught = sum(flagged[s_:e_].any() for s_, e_, _k in events)
+    per_ticker = pd.Series(hit.index).str.rsplit("-", n=1).str[0].value_counts()
+    hours = trading_hours(df)
+    return {
+        "incidents": int(len(hit)),
+        "precision": float(hit.mean()) if len(hit) else 0.0,
+        "event_recall": caught / len(events) if events else 0.0,
+        "alerts_per_hour": (per_ticker.reindex(hours.index, fill_value=0) / hours).to_dict(),
+        "total_per_hour": float(len(hit) / hours.sum()),
+    }
+
+
+def print_incident_rows(rows, tickers):
+    head = " | ".join(f"{t:>5}" for t in tickers)
+    print(f"| {'dataset':<16} | {'incidents':>9} | {'incident precision':>18} | {'events caught':>13} | "
+          f"{'alerts/h/ticker':>15} | {head} |")
+    print(f"|{'-' * 18}|{'-' * 11}|{'-' * 20}|{'-' * 15}|{'-' * 17}|" + "|".join("-" * 7 for _ in tickers) + "|")
+    for name, m in rows:
+        per = " | ".join(f"{m['alerts_per_hour'][t]:>5.1f}" for t in tickers)
+        print(f"| {name:<16} | {m['incidents']:>9,} | {m['precision']:>18.1%} | {m['event_recall']:>13.1%} | "
+              f"{m['total_per_hour']:>15.1f} | {per} |")
+
+
 def print_event_rows(rows):
     print(f"| {'type':<52} | {'events':>6} | {'detected':>8} | {'precision':>9} | {'recall':>7} | {'F1':>6} |")
     print(f"|{'-' * 54}|{'-' * 8}|{'-' * 10}|{'-' * 11}|{'-' * 9}|{'-' * 8}|")
@@ -437,11 +481,13 @@ def variant_section(df, include_heldout, naive_thresholds=None):
         sets += [(k, d, original_events(d) + e) for k, d, e in variant_datasets(df, HELDOUT_VARIANTS, HELDOUT_SEED)]
 
     print("\n## 4. Per-event scores by anomaly type (detector at the job's defaults, all days)\n")
-    det_rows, naive_rows = [], []
+    det_rows, naive_rows, incident_rows = [], [], []
     for name, data, events in sets:
         kinds = ["price_shock", "wash_trade"] if name == "original" else [name]
-        res = event_metrics(*detector_flags(run_detector(data, kwargs)), events, n)
+        out = run_detector(data, kwargs)
+        res = event_metrics(*detector_flags(out), events, n)
         det_rows += [(VARIANT_LABELS[k], res[k]) for k in kinds]
+        incident_rows.append((name, incident_metrics(data, out, events)))
         if naive_thresholds is not None:
             ret, vol = naive_features(data)
             naive_shock = ret > naive_thresholds[0]
@@ -449,10 +495,13 @@ def variant_section(df, include_heldout, naive_thresholds=None):
             res = event_metrics(naive_shock, naive_wash, events, n)
             naive_rows += [(VARIANT_LABELS[k], res[k]) for k in kinds]
     print_event_rows(det_rows)
+    print("\nIncidents (consecutive flags on a ticker grouped by incident_id; alerts = incidents"
+          " per trading hour, overall as the average per ticker; each dataset holds the original anomalies plus its variant):\n")
+    print_incident_rows(incident_rows, sorted(df["ticker"].unique()))
     if naive_rows:
         print("\nNaive fixed-threshold baseline (thresholds tuned tick-level on the time-split train set):\n")
         print_event_rows(naive_rows)
-    return det_rows, naive_rows
+    return det_rows, naive_rows, incident_rows
 
 
 # --------------------------------------------------------------------------
