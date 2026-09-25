@@ -31,6 +31,18 @@ class PersistenceClient(ABC):
         """Return connectivity status, latency, and active backend mode."""
         pass
 
+    @abstractmethod
+    def fetch_recent_ohlc(
+        self,
+        ticker: str,
+        lookback_minutes: int = 15,
+    ) -> pd.DataFrame:
+        """Return 30-second OHLC bars with rolling z-score for the given ticker.
+
+        Columns: time, open, high, low, close, volume, zscore
+        """
+        pass
+
 
 class CassandraClient(PersistenceClient):
     def __init__(self, config: AlertConfig = CONFIG):
@@ -126,12 +138,22 @@ class CassandraClient(PersistenceClient):
         metrics = {}
         for sym in self.config.monitored_tickers:
             sym_df = df[df["ticker"] == sym]
+            try:
+                ohlc = self.fetch_recent_ohlc(ticker=sym, lookback_minutes=lookback_minutes)
+                last_price = float(ohlc["close"].iloc[-1]) if not ohlc.empty else 0.0
+                first_price = float(ohlc["close"].iloc[0]) if not ohlc.empty else last_price
+                pct_chg = ((last_price - first_price) / first_price) * 100 if first_price > 0 else 0.0
+            except Exception:
+                last_price = 0.0
+                pct_chg = 0.0
             metrics[sym] = {
                 "anomaly_count": len(sym_df),
                 "price_shocks": len(sym_df[sym_df["anomaly_type"] == "price_shock"]),
                 "wash_trades": len(sym_df[sym_df["anomaly_type"] == "wash_trade"]),
                 "max_zscore": float(sym_df["zscore"].abs().max()) if not sym_df.empty else 0.0,
                 "latest_event_time": sym_df["event_time"].max() if not sym_df.empty else None,
+                "latest_price": last_price,
+                "pct_change": pct_chg,
             }
         return metrics
 
@@ -157,6 +179,58 @@ class CassandraClient(PersistenceClient):
                 "latency_ms": -1.0,
             }
 
+    def fetch_recent_ohlc(
+        self,
+        ticker: str,
+        lookback_minutes: int = 15,
+    ) -> pd.DataFrame:
+        """Query raw_events from Cassandra and resample into 30s OHLC bars."""
+        if not self._session:
+            self._connect()
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+        query = self._session.prepare(
+            "SELECT event_time, price, volume FROM raw_events "
+            "WHERE ticker = ? AND event_time >= ? ORDER BY event_time ASC"
+        )
+        rows = self._session.execute(query, (ticker, cutoff_time))
+        records = [
+            {"event_time": row.event_time, "price": float(row.price), "volume": float(row.volume)}
+            for row in rows
+        ]
+
+        empty = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "zscore"])
+        if not records:
+            return empty
+
+        df = pd.DataFrame(records)
+        df["event_time"] = pd.to_datetime(df["event_time"], utc=True)
+        df = df.set_index("event_time").sort_index()
+
+        ohlc = df["price"].resample("30s").ohlc().dropna()
+        vol = df["volume"].resample("30s").sum().reindex(ohlc.index).fillna(0)
+
+        # Rolling z-score on 30s closes (window=15 candles, min_periods=5)
+        roll_mean = ohlc["close"].rolling(window=15, min_periods=5).mean()
+        roll_std = ohlc["close"].rolling(window=15, min_periods=5).std()
+        # Guard against near-zero std causing z-score blowup:
+        # suppress where std is below epsilon (price barely moving in window)
+        eps = 1e-4
+        std_safe = roll_std.where((roll_std >= eps) & (roll_std > 0), other=np.nan)
+        zscore = ((ohlc["close"] - roll_mean) / std_safe).fillna(0.0).clip(-6.0, 6.0)
+        zscore = zscore.where(roll_std >= eps, other=0.0).clip(-6.0, 6.0)
+
+        result = pd.DataFrame({
+            "time": ohlc.index,
+            "open": ohlc["open"].values,
+            "high": ohlc["high"].values,
+            "low": ohlc["low"].values,
+            "close": ohlc["close"].values,
+            "volume": vol.values,
+            "zscore": zscore.values,
+        })
+        return result.reset_index(drop=True)
+
 
 class MockReplayClient(PersistenceClient):
     """
@@ -165,16 +239,19 @@ class MockReplayClient(PersistenceClient):
     """
     def __init__(self, config: AlertConfig = CONFIG):
         self.config = config
-        self._dataset_anomalies = self._precompute_dataset_anomalies()
+        self._dataset_anomalies, self._dataset_ohlc = self._precompute_dataset()
         self._sim_window_seconds = 15 * 60
 
-        # Pre-offset by 3 simulated minutes so the first poll immediately returns
-        # a populated anomaly window instead of starting cold at offset=0.
-        # At 5x replay speed, 3 simulated minutes = 36 real seconds of pre-advance.
-        _warm_offset_real_seconds = (3 * 60) / 5.0
+        # Pre-offset by 159 simulated minutes (9540s) so that the default ticker (AAPL)
+        # immediately exhibits a genuine anomaly episode (breach at z=+3.10) with visible
+        # debounced triangle markers, and lookback windows up to 60m are fully populated.
+        # At 5x replay speed, 9540 simulated seconds = 1908 real seconds of pre-advance.
+        _warm_offset_sim_seconds = 9540.0
+        _warm_offset_real_seconds = _warm_offset_sim_seconds / 5.0
         self._start_wall_time = time.time() - _warm_offset_real_seconds
 
-    def _precompute_dataset_anomalies(self) -> pd.DataFrame:
+    def _precompute_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Precompute both anomaly rows and full 30s OHLC bars from the labeled CSV."""
         csv_path = self.config.mock_csv_path
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"Mock dataset not found at {csv_path}")
@@ -183,13 +260,17 @@ class MockReplayClient(PersistenceClient):
         raw["dt"] = pd.to_datetime(raw["event_time_ms"], unit="ms", utc=True)
         raw = raw.sort_values(["ticker", "dt"]).reset_index(drop=True)
 
+        # --- Anomaly rows (with near-zero std guard and [-6, 6] clipping) ---
         processed = []
         for sym, group in raw.groupby("ticker"):
             g = group.set_index("dt")
             rolling_2m = g.rolling("2min", closed="left")
             mean_p = rolling_2m["price"].mean()
-            std_p = rolling_2m["price"].std().replace(0, np.nan)
-            zscore = ((g["price"] - mean_p) / std_p).fillna(0.0)
+            std_p = rolling_2m["price"].std()
+            eps = 1e-4
+            std_safe = std_p.where((std_p >= eps) & (std_p > 0), other=np.nan)
+            zscore = ((g["price"] - mean_p) / std_safe).fillna(0.0).clip(-6.0, 6.0)
+            zscore = zscore.where(std_p >= eps, other=0.0).clip(-6.0, 6.0)
 
             cum_pv = (g["price"] * g["volume"]).cumsum()
             cum_v = g["volume"].cumsum()
@@ -202,23 +283,61 @@ class MockReplayClient(PersistenceClient):
             anomalies["anomaly_type"] = anomalies["label"]
             processed.append(anomalies)
 
-        df = pd.concat(processed).reset_index()
-        df = df.sort_values("dt").reset_index(drop=True)
+        df_anom = pd.concat(processed).reset_index()
+        df_anom = df_anom.sort_values("dt").reset_index(drop=True)
 
-        # Baseline time offsets for simulated stream progression
-        min_ts = df["dt"].min().timestamp()
-        df["relative_offset"] = df["dt"].apply(lambda t: t.timestamp() - min_ts)
-        self._max_relative_offset = df["relative_offset"].max()
-        return df
+        # --- Full OHLC bars (resample ALL ticks into 30s candles) ---
+        ohlc_frames = []
+        for sym, group in raw.groupby("ticker"):
+            g = group.set_index("dt").sort_index()
+            ohlc = g["price"].resample("30s").ohlc().dropna()
+            vol = g["volume"].resample("30s").sum().reindex(ohlc.index).fillna(0)
 
-    def _get_active_simulated_df(self) -> pd.DataFrame:
+            # Rolling z-score on 30s closes (window=15 candles, min_periods=5)
+            roll_mean = ohlc["close"].rolling(window=15, min_periods=5).mean()
+            roll_std = ohlc["close"].rolling(window=15, min_periods=5).std()
+            # Guard against near-zero std causing z-score blowup:
+            eps = 1e-4
+            std_safe = roll_std.where((roll_std >= eps) & (roll_std > 0), other=np.nan)
+            zscore_ohlc = ((ohlc["close"] - roll_mean) / std_safe).fillna(0.0).clip(-6.0, 6.0)
+            zscore_ohlc = zscore_ohlc.where(roll_std >= eps, other=0.0).clip(-6.0, 6.0)
+
+            bar_df = pd.DataFrame({
+                "ticker": sym,
+                "dt": ohlc.index,
+                "open": ohlc["open"].values,
+                "high": ohlc["high"].values,
+                "low": ohlc["low"].values,
+                "close": ohlc["close"].values,
+                "volume": vol.values,
+                "zscore": zscore_ohlc.values,
+            })
+            ohlc_frames.append(bar_df)
+
+        df_ohlc = pd.concat(ohlc_frames).sort_values("dt").reset_index(drop=True)
+
+        # Baseline time offsets for simulated stream progression (shared across both)
+        all_dts = pd.concat([df_anom["dt"], df_ohlc["dt"]])
+        min_ts = all_dts.min().timestamp()
+        df_anom["relative_offset"] = df_anom["dt"].apply(lambda t: t.timestamp() - min_ts)
+        df_ohlc["relative_offset"] = df_ohlc["dt"].apply(lambda t: t.timestamp() - min_ts)
+        self._max_relative_offset = max(
+            df_anom["relative_offset"].max() if not df_anom.empty else 0.0,
+            df_ohlc["relative_offset"].max() if not df_ohlc.empty else 0.0,
+        )
+        return df_anom, df_ohlc
+
+    def _get_replay_state(self, lookback_minutes: int = 15) -> Tuple[datetime, float, float]:
+        """Compute synchronized clock and window offsets shared by all query methods."""
         now_utc = datetime.now(timezone.utc)
         elapsed = time.time() - self._start_wall_time
-        
-        # Advance replay stream at 5x simulated speed
         effective_offset = (elapsed * 5.0) % (self._max_relative_offset or 1.0)
-        
-        window_start_offset = max(0.0, effective_offset - self._sim_window_seconds)
+        window_seconds = lookback_minutes * 60
+        window_start_offset = max(0.0, effective_offset - window_seconds)
+        return now_utc, effective_offset, window_start_offset
+
+    def _get_active_simulated_df(self, lookback_minutes: int = 15) -> pd.DataFrame:
+        now_utc, effective_offset, window_start_offset = self._get_replay_state(lookback_minutes)
         sub = self._dataset_anomalies[
             (self._dataset_anomalies["relative_offset"] >= window_start_offset) &
             (self._dataset_anomalies["relative_offset"] <= effective_offset)
@@ -236,7 +355,7 @@ class MockReplayClient(PersistenceClient):
         ticker: Optional[str] = None,
         limit: int = 200,
     ) -> pd.DataFrame:
-        sub = self._get_active_simulated_df()
+        sub = self._get_active_simulated_df(lookback_minutes=lookback_minutes)
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
         filtered = sub[sub["event_time"] >= cutoff]
 
@@ -252,12 +371,22 @@ class MockReplayClient(PersistenceClient):
         metrics = {}
         for sym in self.config.monitored_tickers:
             sym_df = df[df["ticker"] == sym]
+            try:
+                ohlc = self.fetch_recent_ohlc(ticker=sym, lookback_minutes=lookback_minutes)
+                last_price = float(ohlc["close"].iloc[-1]) if not ohlc.empty else 0.0
+                first_price = float(ohlc["close"].iloc[0]) if not ohlc.empty else last_price
+                pct_chg = ((last_price - first_price) / first_price) * 100 if first_price > 0 else 0.0
+            except Exception:
+                last_price = 0.0
+                pct_chg = 0.0
             metrics[sym] = {
                 "anomaly_count": len(sym_df),
                 "price_shocks": len(sym_df[sym_df["anomaly_type"] == "price_shock"]),
                 "wash_trades": len(sym_df[sym_df["anomaly_type"] == "wash_trade"]),
                 "max_zscore": float(sym_df["zscore"].abs().max()) if not sym_df.empty else 0.0,
                 "latest_event_time": sym_df["event_time"].max() if not sym_df.empty else None,
+                "latest_price": last_price,
+                "pct_change": pct_chg,
             }
         return metrics
 
@@ -269,6 +398,34 @@ class MockReplayClient(PersistenceClient):
             "dataset_anomalies_loaded": len(self._dataset_anomalies),
             "latency_ms": 0.45,
         }
+
+    def fetch_recent_ohlc(
+        self,
+        ticker: str,
+        lookback_minutes: int = 15,
+    ) -> pd.DataFrame:
+        """Return 30s OHLC bars for `ticker`, re-anchored to the current replay clock."""
+        now_utc, effective_offset, window_start_offset = self._get_replay_state(lookback_minutes)
+        sub = self._dataset_ohlc[
+            (self._dataset_ohlc["ticker"] == ticker) &
+            (self._dataset_ohlc["relative_offset"] >= window_start_offset) &
+            (self._dataset_ohlc["relative_offset"] <= effective_offset)
+        ].copy()
+
+        if sub.empty:
+            return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "zscore"])
+
+        # Re-anchor bar timestamps to current UTC time (same logic as anomalies)
+        sub["time"] = sub["relative_offset"].apply(
+            lambda off: now_utc - timedelta(seconds=(effective_offset - off))
+        )
+
+        # Apply lookback filter
+        cutoff = now_utc - timedelta(minutes=lookback_minutes)
+        sub = sub[sub["time"] >= cutoff]
+
+        cols = ["time", "open", "high", "low", "close", "volume", "zscore"]
+        return sub[cols].sort_values("time").reset_index(drop=True)
 
 
 def get_persistence_client(config: AlertConfig = CONFIG) -> PersistenceClient:
