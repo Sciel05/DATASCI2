@@ -596,6 +596,24 @@ def test_tick_id_is_unique_and_stable_across_batches():
     assert first["tick_id"].tolist() + second["tick_id"].tolist() == whole["tick_id"].tolist()
 
 
+def test_volume_spike_fires_on_a_large_print_after_warmup_even_if_price_moves():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_h=1e9, cusum_volume_h=1e9, volume_spike_multiple=6.0,
+    )
+    rng = np.random.default_rng(2)
+    calm = [(100.0 + (0.5 if i % 2 == 0 else -0.5), 100.0 * np.exp(rng.normal(0, 0.2))) for i in range(60)]
+    early = make_ticks([calm[0], (100.0, 5000.0)] + calm[1:])  # a big print during warm-up
+    out, _ = run(fn, early)
+    assert not out.iloc[1]["is_anomaly"]  # not scored yet
+    out, _ = run(fn, make_ticks(calm + [(100.5, 1000.0)]))  # ~10x typical, moving market
+    last = out.iloc[-1]
+    assert last["anomaly_type"] == "wash_trade"
+    assert last["signals"] == "volume_spike"
+    out, _ = run(fn, make_ticks(calm + [(100.5, 300.0)]))  # ~3x typical: under the 6x limit
+    assert not out.iloc[-1]["is_anomaly"]
+
+
 def test_checkpoint_path_includes_state_layout_version():
     path = checkpoint_path("./checkpoints/detect_anomalies/", "baseline")
     assert path == f"./checkpoints/detect_anomalies/state-v{STATE_LAYOUT_VERSION}/baseline"

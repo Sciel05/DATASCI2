@@ -46,6 +46,12 @@ across micro-batches rather than restarting cold at every batch boundary:
    market add up (wash trades split into normal-sized pieces). Price
    CUSUM flags "price_shock", volume CUSUM "wash_trade".
 
+5. Volume spike: the naive volume-threshold rule, scaled per ticker -- a
+   tick whose volume exceeds --volume-spike-multiple (6) times the
+   ticker's typical (slow-average) volume, with no flat-market condition.
+   Catches the obvious large wash prints the gated signals can miss.
+   Flags "wash_trade".
+
 Risk score and incidents: every signal is expressed as a multiple of its
 own alarm level (|z| / --zscore-threshold, CUSUM / h, tick volume / the
 wash rule's volume limit, ...) and risk_score is the largest of them. A
@@ -272,6 +278,7 @@ def make_baseline_update_fn(
     cusum_min_samples=50,
     risk_threshold=1.0,
     incident_gap_ticks=10,
+    volume_spike_multiple=6.0,
 ):
     """Builds the per-ticker flatMapGroupsWithState function (PySpark:
     applyInPandasWithState). Closes over the tuned thresholds so they don't
@@ -459,6 +466,14 @@ def make_baseline_update_fn(
                     zscore, vwap_div = None, None
                     clipped_price = row.price
 
+                # Volume spike: the naive volume-threshold rule, scaled per
+                # ticker -- this tick's volume against a multiple of the
+                # ticker's typical (slow-average) volume, with no flat-market
+                # condition. Scored once the volume statistics are warm.
+                volume_spike_ratio = 0.0
+                if volume_spike_multiple > 0 and cusum_warm:
+                    volume_spike_ratio = row.volume / (volume_spike_multiple * math.exp(cusum_logv_mean))
+
                 # Risk: each signal as a multiple of its own alarm level (0
                 # while that signal is still warming up); risk_score is the
                 # largest. Price signals take precedence for anomaly_type.
@@ -470,6 +485,7 @@ def make_baseline_update_fn(
                 )
                 volume_scores = (
                     ("wash_rule", wash_ratio),
+                    ("volume_spike", volume_spike_ratio),
                     ("cusum_volume", cusum_volume_out / cusum_volume_h if cusum_volume_out is not None else 0.0),
                 )
                 risk_score = max(r for _name, r in price_scores + volume_scores)
@@ -619,6 +635,7 @@ def detector_kwargs(args):
         cusum_min_samples=args.cusum_min_samples,
         risk_threshold=args.risk_threshold,
         incident_gap_ticks=args.incident_gap_ticks,
+        volume_spike_multiple=args.volume_spike_multiple,
     )
 
 
@@ -836,6 +853,11 @@ def parse_args(argv=None):
                     help="Span (ticks) of the slow tick-sigma and log-volume statistics")
     ap.add_argument("--cusum-min-samples", type=int, default=50,
                     help="Ticks since the last reset before the CUSUMs are scored")
+
+    # volume spike (the naive volume-threshold rule, as a risk signal)
+    ap.add_argument("--volume-spike-multiple", type=float, default=6.0,
+                    help="Flag a tick whose volume exceeds this multiple of the ticker's typical "
+                    "(slow-average) volume; 0 = off")
 
     # risk score and incidents
     ap.add_argument("--risk-threshold", type=float, default=1.0,
