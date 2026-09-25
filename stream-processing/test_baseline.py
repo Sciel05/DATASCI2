@@ -258,6 +258,7 @@ def test_resumes_from_legacy_tuple_state_blob(n_fields):
     saved = pickle.loads(blob)
     assert isinstance(saved, dict)
     assert len(saved["window"]) == 13
+    assert saved["late_dropped"] == 0
 
 
 # --- overnight gap reset
@@ -304,6 +305,70 @@ def test_gap_reset_is_configurable_and_short_gaps_keep_the_baseline():
     out, state = run(fn, after_long, state=state)
     assert out.iloc[0]["zscore"] is None
     assert len(load_state(state)["window"]) == 1
+
+
+# --- late / out-of-order ticks
+
+
+def test_out_of_order_ticks_within_a_batch_are_reordered_not_dropped():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    specs = [(100.0 + 0.01 * (i % 3), 100.0 + i) for i in range(40)]
+    in_order = make_ticks(specs)
+    shuffled = in_order.sample(frac=1.0, random_state=3).reset_index(drop=True)
+
+    expected, _ = run(fn, in_order)
+    out, state = run(fn, shuffled)
+    assert len(out) == 40
+    assert load_state(state)["late_dropped"] == 0
+    pd.testing.assert_frame_equal(out, expected)
+
+
+def test_tick_older_than_previous_batch_is_dropped_and_counted():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    ticks = make_ticks([(100.0, 100.0)] * 20)
+    _, state = run(fn, ticks.iloc[:15])
+    # batch 2 carries one straggler from before batch 1's last tick
+    late = ticks.iloc[[7]]
+    out, state = run(fn, pd.concat([late, ticks.iloc[15:]], ignore_index=True), state=state)
+
+    assert len(out) == 5, "the straggler must not be emitted"
+    assert load_state(state)["late_dropped"] == 1
+    assert len(load_state(state)["window"]) == 20  # 15 + 5, straggler excluded
+
+
+def test_same_timestamp_as_last_tick_is_not_late():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    ticks = make_ticks([(100.0, 100.0)] * 10)
+    _, state = run(fn, ticks)
+    same_ms = ticks.iloc[[-1]]
+    out, state = run(fn, same_ms, state=state)
+    assert len(out) == 1
+    assert load_state(state)["late_dropped"] == 0
+
+
+def test_replay_with_shuffled_stragglers_drops_exactly_the_late_ones():
+    """Replay 300 ticks in 50-tick micro-batches, but hold a few ticks back
+    and deliver them one batch late -- the way a slow partition or a retry
+    would. Exactly those ticks are dropped and counted; everything else is
+    emitted, and the running count survives across batches."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    ticks = make_ticks([(100.0 + 0.01 * (i % 5), 100.0) for i in range(300)])
+    batches = [ticks.iloc[i : i + 50] for i in range(0, 300, 50)]
+    held_back = {1: [10, 20, 30], 3: [5]}  # batch index -> row offsets delivered a batch late
+
+    state = FakeState()
+    emitted = 0
+    carry = None
+    for b, batch in enumerate(batches):
+        late_rows = batch.iloc[held_back.get(b, [])]
+        on_time = batch.drop(index=late_rows.index)
+        feed = on_time if carry is None else pd.concat([carry, on_time])
+        out, state = run(fn, feed.reset_index(drop=True), state=state)
+        emitted += len(out)
+        carry = late_rows if len(late_rows) else None
+
+    assert load_state(state)["late_dropped"] == 4
+    assert emitted == 300 - 4
 
 
 if __name__ == "__main__":

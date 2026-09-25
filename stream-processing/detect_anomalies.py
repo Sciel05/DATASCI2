@@ -29,7 +29,10 @@ across micro-batches rather than restarting cold at every batch boundary:
 
 Both detectors start cold after a gap longer than --gap-reset-minutes
 (overnight/weekend), so the morning open isn't scored against yesterday's
-close.
+close. A tick older than one already processed for its ticker (i.e. it
+arrived in a later micro-batch) is dropped and counted rather than scored
+against its own future; ticks later than --late-watermark are dropped by
+Spark before they reach the state function. Both counts are reported.
 
 `label` is present in the Kafka payload for evaluation only (see
 data-ingestion/README.md and stream-processing/README.md) and is
@@ -52,6 +55,7 @@ Run with spark-submit so the Kafka connector package resolves, e.g.:
 
 import argparse
 import pickle
+import sys
 
 import pandas as pd
 from pyspark.sql import SparkSession, functions as F
@@ -113,7 +117,8 @@ def empty_state():
     -- see the bounded-influence comment in make_baseline_update_fn for why
     raw and clipped diverge. wash_hist: list of (event_time_ms, price,
     volume) covering the trailing wash lookback. last_ts: event_time_ms of
-    the last tick processed."""
+    the last tick processed. late_dropped: running count of dropped late
+    ticks."""
     return {
         "window": [],
         "sum_price": 0.0,
@@ -122,6 +127,7 @@ def empty_state():
         "sum_v": 0.0,
         "wash_hist": [],
         "last_ts": None,
+        "late_dropped": 0,
     }
 
 
@@ -161,11 +167,20 @@ def make_baseline_update_fn(
         st = load_state(state)
         window, wash_hist = st["window"], st["wash_hist"]
         sum_price, sum_sq, sum_pv, sum_v = st["sum_price"], st["sum_sq"], st["sum_pv"], st["sum_v"]
-        last_ts = st["last_ts"]
+        last_ts, late_dropped = st["last_ts"], st["late_dropped"]
+        batch_late = 0
 
         rows_out = []
         for pdf in pdf_iter:
             for row in pdf.sort_values("event_time_ms", kind="stable").itertuples(index=False):
+                if last_ts is not None and row.event_time_ms < last_ts:
+                    # Late: older than a tick already processed for this
+                    # ticker. Within a batch ticks are sorted first, so this
+                    # only happens across micro-batches. Scoring it now would
+                    # compare it against its own future, so drop and count it.
+                    late_dropped += 1
+                    batch_late += 1
+                    continue
                 if last_ts is not None and row.event_time_ms - last_ts > gap_reset_ms:
                     # Overnight/weekend (or feed outage) gap: yesterday's
                     # close is no baseline for this morning's open, so both
@@ -282,6 +297,14 @@ def make_baseline_update_fn(
                     sum_pv -= old_raw * old_vol
                     sum_v -= old_vol
 
+        if batch_late:
+            # executor log line -- the running total is also kept in state
+            print(
+                f"[detect_anomalies] {key[0]}: dropped {batch_late} late tick(s) "
+                f"this batch, {late_dropped} total",
+                file=sys.stderr,
+                flush=True,
+            )
         state.update(
             (
                 pickle.dumps(
@@ -293,6 +316,7 @@ def make_baseline_update_fn(
                         "sum_v": sum_v,
                         "wash_hist": wash_hist,
                         "last_ts": last_ts,
+                        "late_dropped": late_dropped,
                     }
                 ),
             )
@@ -329,7 +353,9 @@ def build_baseline_stream(parsed, args):
         gap_reset_ms=int(args.gap_reset_minutes * 60 * 1000),
     )
     return (
-        parsed.groupBy("ticker").applyInPandasWithState(
+        parsed.withWatermark("event_time", args.late_watermark)
+        .groupBy("ticker")
+        .applyInPandasWithState(
             update_baseline,
             outputStructType=OUTPUT_SCHEMA,
             stateStructType=BASELINE_STATE_SCHEMA,
@@ -505,6 +531,14 @@ def parse_args():
         "arrives more than this long after the previous one (overnight/weekend "
         "gaps are 17.5h+ on the labeled data; there are no intraday gaps over 5 min)",
     )
+    ap.add_argument(
+        "--late-watermark",
+        default="1 minute",
+        help="Event-time watermark: ticks later than this are dropped by Spark "
+        "before the state function (reported as numRowsDroppedByWatermark). "
+        "Ticks within it but older than the ticker's last processed tick are "
+        "dropped and counted by the state function itself.",
+    )
 
     ap.add_argument(
         "--trigger-once",
@@ -527,6 +561,12 @@ def main():
     if args.trigger_once:
         for h in handles:
             h.awaitTermination()
+            dropped = sum(
+                op.get("numRowsDroppedByWatermark", 0)
+                for progress in h.recentProgress
+                for op in progress.get("stateOperators", [])
+            )
+            print(f"[detect_anomalies] ticks dropped by watermark: {dropped}", file=sys.stderr)
     else:
         spark.streams.awaitAnyTermination()
 
