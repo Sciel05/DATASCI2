@@ -339,8 +339,11 @@ def make_baseline_update_fn(
     return update_baseline
 
 
-def build_baseline_stream(parsed, args):
-    update_baseline = make_baseline_update_fn(
+def detector_kwargs(args):
+    """make_baseline_update_fn kwargs from parsed CLI args -- shared by the
+    Spark job, parity_check.py and evaluate_generalization.py so offline
+    scoring always uses the job's exact settings."""
+    return dict(
         window_size=args.baseline_window,
         min_samples=args.min_samples,
         z_threshold=args.zscore_threshold,
@@ -352,6 +355,10 @@ def build_baseline_stream(parsed, args):
         wash_min_prior=args.wash_min_prior,
         gap_reset_ms=int(args.gap_reset_minutes * 60 * 1000),
     )
+
+
+def build_baseline_stream(parsed, args):
+    update_baseline = make_baseline_update_fn(**detector_kwargs(args))
     return (
         parsed.withWatermark("event_time", args.late_watermark)
         .groupBy("ticker")

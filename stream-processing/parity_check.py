@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from detect_anomalies import make_baseline_update_fn, parse_args
+from detect_anomalies import detector_kwargs, make_baseline_update_fn, parse_args
 
 HERE = Path(__file__).resolve().parent
 DATA_PATH = HERE.parent / "data-ingestion" / "aapl_msft_googl_tsla_nvda_ticks_labeled.csv"
@@ -101,21 +101,6 @@ def write_slice(days):
     day_df.to_csv(slice_path(days), index=False)
     print(f"wrote {len(day_df):,} ticks ({day_df['ticker'].nunique()} tickers) to {slice_path(days)}")
     return day_df
-
-
-def detector_kwargs(args):
-    return dict(
-        window_size=args.baseline_window,
-        min_samples=args.min_samples,
-        z_threshold=args.zscore_threshold,
-        vwap_threshold=args.vwap_threshold,
-        clip_k=args.clip_k,
-        wash_lookback_ms=int(args.wash_lookback_seconds * 1000),
-        wash_volume_ratio=args.wash_volume_ratio,
-        wash_price_range=args.wash_price_range,
-        wash_min_prior=args.wash_min_prior,
-        gap_reset_ms=int(args.gap_reset_minutes * 60 * 1000),
-    )
 
 
 def run_offline(ticks, args):
