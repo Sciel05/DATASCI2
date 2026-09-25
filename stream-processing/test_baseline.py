@@ -499,9 +499,14 @@ def test_wash_lookback_scales_to_the_tickers_trading_rate():
     5s, so a modest print is judged against the last few small trades
     rather than a minute of earlier heavy volume."""
     specs = [(100.0, 1000.0)] * 20 + [(100.0, 10.0)] * 5 + [(100.0, 30.0)]
-    fixed = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9)
+    # ratio pinned at 0.3: this tests the lookback, not the ratio default
+    fixed = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, wash_volume_ratio=0.3,
+        wash_lookback_ticks=0,
+    )
     scaled = make_baseline_update_fn(
-        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, wash_lookback_ticks=5
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, wash_volume_ratio=0.3,
+        wash_lookback_ticks=5,
     )
     out_fixed, _ = run(fixed, make_ticks(specs))
     out_scaled, state = run(scaled, make_ticks(specs))

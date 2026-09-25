@@ -22,7 +22,7 @@ across micro-batches rather than restarting cold at every batch boundary:
    branch): a tick is flagged when the ticker's trailing
    --wash-lookback-seconds of ticks moved in price by less than
    --wash-price-range, yet this single tick's volume exceeds
-   --wash-volume-ratio of that whole trailing volume -- i.e. a large
+   --wash-volume-ratio (70%) of that whole trailing volume -- i.e. a large
    print into a flat market (needs at least --wash-min-prior prior
    ticks). With --wash-lookback-ticks, the lookback is that many ticks'
    worth of the ticker's typical time between ticks (a slow average), so
@@ -268,8 +268,8 @@ def make_baseline_update_fn(
     vwap_threshold,
     clip_k=5.0,
     wash_lookback_ms=120_000,
-    wash_volume_ratio=0.3,
-    wash_price_range=0.001,
+    wash_volume_ratio=0.7,
+    wash_price_range=0.0015,
     wash_min_prior=4,
     wash_lookback_ticks=16,
     rate_span=200,
@@ -807,16 +807,18 @@ def parse_args(argv=None):
     ap.add_argument(
         "--wash-volume-ratio",
         type=float,
-        default=0.3,
+        default=0.7,
         help="Flag a tick whose volume exceeds this fraction of the trailing lookback's "
-        "total volume (while the price range stays under --wash-price-range)",
+        "total volume (while the price range stays under --wash-price-range). Tuned on "
+        "the training split: at >= ~0.7 results match switching the rule off, since the "
+        "volume spike and volume CUSUM cover what it caught; lower values add false alarms",
     )
     ap.add_argument(
         "--wash-price-range",
         type=float,
-        default=0.001,
+        default=0.0015,
         help="Max (max_price - min_price) / min_price across the trailing lookback for "
-        "the market to count as flat (default 0.1%%)",
+        "the market to count as flat (default 0.15%%); also gates the volume CUSUM",
     )
     ap.add_argument(
         "--wash-lookback-ticks",
