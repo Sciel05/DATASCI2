@@ -13,25 +13,14 @@ import pickle
 import pandas as pd
 import pytest
 
-from detect_anomalies import make_baseline_update_fn
-
-
-def state_tuple(state):
-    """Unpickle the (window, sum_price, sum_sq, sum_pv, sum_v, wash_hist)
-    tuple out of the state blob -- see the BASELINE_STATE_SCHEMA comment in
-    detect_anomalies.py for why it's a pickled blob rather than plain fields.
-    `window` is a list of (raw_price, clipped_price, volume) triples: raw
-    feeds VWAP's accumulators, clipped feeds the mean/variance accumulators
-    -- see the bounded-influence comment in make_baseline_update_fn."""
-    (blob,) = state.get
-    return pickle.loads(blob)
+from detect_anomalies import load_state, make_baseline_update_fn
 
 
 def std_from_state(state):
-    window, sum_price, sum_sq, _sum_pv, _sum_v, _wash_hist = state_tuple(state)
-    n = len(window)
-    mean = sum_price / n
-    variance = max(sum_sq / n - mean * mean, 0.0)
+    st = load_state(state)
+    n = len(st["window"])
+    mean = st["sum_price"] / n
+    variance = max(st["sum_sq"] / n - mean * mean, 0.0)
     return variance**0.5
 
 
@@ -179,13 +168,13 @@ def test_window_evicts_oldest_and_sums_stay_consistent():
     out, state = run(fn, pdf)
     assert out["is_anomaly"].eq(False).all(), "small steady drift should not trip either threshold"
 
-    window, sum_price, sum_sq, sum_pv, sum_v, _wash_hist = state_tuple(state)
-    raw_prices = [w[0] for w in window]
-    clipped_prices = [w[1] for w in window]
-    assert len(window) == 5
+    st = load_state(state)
+    raw_prices = [w[0] for w in st["window"]]
+    clipped_prices = [w[1] for w in st["window"]]
+    assert len(st["window"]) == 5
     assert raw_prices == prices_in[-5:]
-    assert abs(sum_price - sum(clipped_prices)) < 1e-6
-    assert abs(sum_sq - sum(p * p for p in clipped_prices)) < 1e-6
+    assert abs(st["sum_price"] - sum(clipped_prices)) < 1e-6
+    assert abs(st["sum_sq"] - sum(p * p for p in clipped_prices)) < 1e-6
 
 
 def test_state_round_trips_across_batches():
@@ -199,8 +188,7 @@ def test_state_round_trips_across_batches():
     second_batch = make_ticks([(100.0, 100.0)], start_ms=1_700_000_020_000)
     out2, state = run(fn, second_batch, state=state)
     assert not out2.empty
-    window, *_ = state_tuple(state)
-    assert len(window) == 16
+    assert len(load_state(state)["window"]) == 16
 
 
 def test_wash_trade_flagged_for_large_print_into_flat_market():
@@ -255,16 +243,67 @@ def test_wash_history_round_trips_across_batches():
     assert out2.iloc[0]["anomaly_type"] == "wash_trade"
 
 
-def test_resumes_from_pre_wash_trade_state_blob():
-    """State checkpointed before the wash-trade detector moved into this
-    function holds a 5-tuple; it must still load."""
+@pytest.mark.parametrize("n_fields", [5, 6])
+def test_resumes_from_legacy_tuple_state_blob(n_fields):
+    """Checkpoints written by earlier versions hold a positional tuple (5
+    fields before the wash-trade detector moved in, 6 after); both must
+    still load, and be re-saved in the current dict layout."""
     fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
     state = FakeState()
-    old_window = [(100.0, 100.0, 100.0)] * 12
-    state.update((pickle.dumps((old_window, 1200.0, 120000.0, 120000.0, 1200.0)),))
+    legacy = ([(100.0, 100.0, 100.0)] * 12, 1200.0, 120000.0, 120000.0, 1200.0, [])[:n_fields]
+    state.update((pickle.dumps(legacy),))
     out, state = run(fn, make_ticks([(100.0, 100.0)]), state=state)
+    assert out.iloc[0]["zscore"] is not None, "resumed baseline should already be warm"
+    (blob,) = state.get
+    saved = pickle.loads(blob)
+    assert isinstance(saved, dict)
+    assert len(saved["window"]) == 13
+
+
+# --- overnight gap reset
+
+
+def test_gap_resets_baseline_so_open_is_not_scored_against_prior_close():
+    """Feed a day's close, then the next morning's open ~17.5h later at a
+    very different price level. Without a reset the first morning ticks
+    would be scored against yesterday's close (a huge z-score and a false
+    price_shock). With it, the morning re-warms from scratch."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    close_ms = 1_700_000_000_000
+    close = make_ticks(
+        [(100.0 + (0.01 if i % 2 == 0 else -0.01), 100.0) for i in range(30)], start_ms=close_ms
+    )
+    open_ms = close_ms + 30 * 1000 + int(17.5 * 3600 * 1000)
+    morning = make_ticks(
+        [(110.0 + (0.01 if i % 2 == 0 else -0.01), 100.0) for i in range(15)], start_ms=open_ms
+    )
+
+    _, state = run(fn, close)
+    assert len(load_state(state)["window"]) == 20
+    out, state = run(fn, morning, state=state)
+
+    # first min_samples morning ticks are warm-up: unscored, never flagged
+    assert out.iloc[:10]["zscore"].isna().all()
+    assert not out["is_anomaly"].any()
+    # the baseline now holds only morning ticks
+    assert all(raw >= 109.0 for raw, _clipped, _vol in load_state(state)["window"])
+
+
+def test_gap_reset_is_configurable_and_short_gaps_keep_the_baseline():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01, gap_reset_ms=60_000
+    )
+    first = make_ticks([(100.0, 100.0)] * 12, start_ms=1_700_000_000_000)
+    _, state = run(fn, first)
+    # 50s later: under the 60s reset, the baseline carries over
+    after_short = make_ticks([(100.0, 100.0)], start_ms=1_700_000_011_000 + 50_000)
+    out, state = run(fn, after_short, state=state)
     assert out.iloc[0]["zscore"] is not None
-    assert len(state_tuple(state)) == 6
+    # 2 min later: over it, the baseline resets
+    after_long = make_ticks([(100.0, 100.0)], start_ms=1_700_000_061_000 + 120_000)
+    out, state = run(fn, after_long, state=state)
+    assert out.iloc[0]["zscore"] is None
+    assert len(load_state(state)["window"]) == 1
 
 
 if __name__ == "__main__":

@@ -27,6 +27,10 @@ across micro-batches rather than restarting cold at every batch boundary:
    README, not a validated detector. Flags anomaly_type="wash_trade"
    (price_shock takes precedence if both fire on the same tick).
 
+Both detectors start cold after a gap longer than --gap-reset-minutes
+(overnight/weekend), so the morning open isn't scored against yesterday's
+close.
+
 `label` is present in the Kafka payload for evaluation only (see
 data-ingestion/README.md and stream-processing/README.md) and is
 dropped immediately after parsing -- it is never read as a detection
@@ -99,6 +103,42 @@ OUTPUT_SCHEMA = StructType(
 # window into BinaryType sidesteps that nested-type schema path entirely.
 BASELINE_STATE_SCHEMA = StructType([StructField("blob", BinaryType())])
 
+# Earlier versions of this job pickled a positional tuple; these were its
+# fields, in order (the 5-field layout predates wash_hist).
+_LEGACY_STATE_FIELDS = ["window", "sum_price", "sum_sq", "sum_pv", "sum_v", "wash_hist"]
+
+
+def empty_state():
+    """Per-ticker state. window: list of (raw_price, clipped_price, volume)
+    -- see the bounded-influence comment in make_baseline_update_fn for why
+    raw and clipped diverge. wash_hist: list of (event_time_ms, price,
+    volume) covering the trailing wash lookback. last_ts: event_time_ms of
+    the last tick processed."""
+    return {
+        "window": [],
+        "sum_price": 0.0,
+        "sum_sq": 0.0,
+        "sum_pv": 0.0,
+        "sum_v": 0.0,
+        "wash_hist": [],
+        "last_ts": None,
+    }
+
+
+def load_state(state):
+    """Unpickles the state blob into a dict, filling fields that older
+    checkpoints didn't have (a dict, so new fields don't need another
+    positional layout)."""
+    st = empty_state()
+    if state.exists:
+        (blob,) = state.get
+        saved = pickle.loads(blob)
+        if isinstance(saved, dict):
+            st.update(saved)
+        else:
+            st.update(zip(_LEGACY_STATE_FIELDS, saved))
+    return st
+
 
 def make_baseline_update_fn(
     window_size,
@@ -110,6 +150,7 @@ def make_baseline_update_fn(
     wash_volume_ratio=0.3,
     wash_price_range=0.001,
     wash_min_prior=4,
+    gap_reset_ms=30 * 60 * 1000,
 ):
     """Builds the per-ticker flatMapGroupsWithState function (PySpark:
     applyInPandasWithState). Closes over the tuned thresholds so they don't
@@ -117,26 +158,22 @@ def make_baseline_update_fn(
     """
 
     def update_baseline(key, pdf_iter, state: GroupState):
-        if state.exists:
-            (blob,) = state.get
-            # window: list of (raw_price, clipped_price, volume) -- see the
-            # bounded-influence comment below for why raw and clipped diverge.
-            # wash_hist: list of (event_time_ms, price, volume) covering the
-            # trailing wash_lookback_ms, for the wash-trade heuristic.
-            saved = pickle.loads(blob)
-            if len(saved) == 5:
-                # state checkpointed before the wash-trade detector moved in
-                # here -- resume the baseline, start the wash history empty
-                saved = (*saved, [])
-            window, sum_price, sum_sq, sum_pv, sum_v, wash_hist = saved
-        else:
-            window = []
-            sum_price = sum_sq = sum_pv = sum_v = 0.0
-            wash_hist = []
+        st = load_state(state)
+        window, wash_hist = st["window"], st["wash_hist"]
+        sum_price, sum_sq, sum_pv, sum_v = st["sum_price"], st["sum_sq"], st["sum_pv"], st["sum_v"]
+        last_ts = st["last_ts"]
 
         rows_out = []
         for pdf in pdf_iter:
-            for row in pdf.sort_values("event_time_ms").itertuples(index=False):
+            for row in pdf.sort_values("event_time_ms", kind="stable").itertuples(index=False):
+                if last_ts is not None and row.event_time_ms - last_ts > gap_reset_ms:
+                    # Overnight/weekend (or feed outage) gap: yesterday's
+                    # close is no baseline for this morning's open, so both
+                    # detectors start cold and re-warm.
+                    window, wash_hist = [], []
+                    sum_price = sum_sq = sum_pv = sum_v = 0.0
+                last_ts = row.event_time_ms
+
                 # Wash-trade heuristic, scored against ticks strictly before
                 # this one within the lookback (same-millisecond ticks are
                 # excluded, matching the original rangeBetween(-lookback, -1)).
@@ -245,7 +282,21 @@ def make_baseline_update_fn(
                     sum_pv -= old_raw * old_vol
                     sum_v -= old_vol
 
-        state.update((pickle.dumps((window, sum_price, sum_sq, sum_pv, sum_v, wash_hist)),))
+        state.update(
+            (
+                pickle.dumps(
+                    {
+                        "window": window,
+                        "sum_price": sum_price,
+                        "sum_sq": sum_sq,
+                        "sum_pv": sum_pv,
+                        "sum_v": sum_v,
+                        "wash_hist": wash_hist,
+                        "last_ts": last_ts,
+                    }
+                ),
+            )
+        )
 
         yield pd.DataFrame(
             rows_out,
@@ -275,6 +326,7 @@ def build_baseline_stream(parsed, args):
         wash_volume_ratio=args.wash_volume_ratio,
         wash_price_range=args.wash_price_range,
         wash_min_prior=args.wash_min_prior,
+        gap_reset_ms=int(args.gap_reset_minutes * 60 * 1000),
     )
     return (
         parsed.groupBy("ticker").applyInPandasWithState(
@@ -442,6 +494,16 @@ def parse_args():
         default=4,
         help="Minimum prior ticks in the lookback before the wash-trade check applies, "
         "so the first few ticks after a quiet gap can't trivially exceed the volume ratio",
+    )
+
+    # stream hygiene
+    ap.add_argument(
+        "--gap-reset-minutes",
+        type=float,
+        default=30.0,
+        help="Reset a ticker's baseline and wash-trade history when the next tick "
+        "arrives more than this long after the previous one (overnight/weekend "
+        "gaps are 17.5h+ on the labeled data; there are no intraday gaps over 5 min)",
     )
 
     ap.add_argument(
