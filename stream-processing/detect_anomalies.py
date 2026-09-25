@@ -23,9 +23,13 @@ across micro-batches rather than restarting cold at every batch boundary:
    --wash-lookback-seconds of ticks moved in price by less than
    --wash-price-range, yet this single tick's volume exceeds
    --wash-volume-ratio of that whole trailing volume -- i.e. a large
-   print into a flat market (needs at least --wash-min-prior prior ticks). Explicitly a simplified heuristic per the
-   README, not a validated detector. Flags anomaly_type="wash_trade"
-   (price_shock takes precedence if both fire on the same tick).
+   print into a flat market (needs at least --wash-min-prior prior
+   ticks). With --wash-lookback-ticks, the lookback is that many ticks'
+   worth of the ticker's typical time between ticks (a slow average), so
+   busy and quiet tickers look back over a comparable number of trades.
+   Explicitly a simplified heuristic per the README, not a validated
+   detector. Flags anomaly_type="wash_trade" (price_shock takes
+   precedence if both fire on the same tick).
 
 3. Ramp signal (EWMA divergence): a fast EWMA of price (--ewma-fast-span)
    against a slow one (--ewma-slow-span), normalized by the divergence's
@@ -133,7 +137,8 @@ OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
 # BASELINE_STATE_SCHEMA -- or what the detector keeps in state -- changes;
 # the job then starts from a fresh checkpoint directory instead of failing
 # on the old one. v1: pickled blob only. v2: blob + typed CUSUM fields.
-STATE_LAYOUT_VERSION = 2
+# v3: typical time between ticks (rate_dt_ms, rate_n) in the blob.
+STATE_LAYOUT_VERSION = 3
 #
 # CUSUM state is kept as plain typed fields next to the blob (scalars only,
 # so the ArrayType problem above doesn't apply).
@@ -178,6 +183,9 @@ def empty_state():
         "ewma_slow": None,
         "ewma_div_ms": 0.0,
         "ewma_n": 0,
+        # typical time between ticks (slow EWMA, ms) for the wash lookback
+        "rate_dt_ms": 0.0,
+        "rate_n": 0,
         **empty_cusum_state(),
     }
 
@@ -223,6 +231,10 @@ def make_baseline_update_fn(
     wash_volume_ratio=0.3,
     wash_price_range=0.001,
     wash_min_prior=4,
+    wash_lookback_ticks=16,
+    rate_span=200,
+    rate_min_samples=20,
+    rate_gap_cap_ms=60_000,
     gap_reset_ms=30 * 60 * 1000,
     ewma_fast_span=3,
     ewma_slow_span=20,
@@ -244,6 +256,7 @@ def make_baseline_update_fn(
     # the divergence's RMS adapts at half the slow average's speed
     alpha_div = 2.0 / (2 * ewma_slow_span + 1)
     alpha_sigma = 2.0 / (cusum_sigma_span + 1)
+    alpha_rate = 2.0 / (rate_span + 1)
 
     def update_baseline(key, pdf_iter, state: GroupState):
         st = load_state(state)
@@ -252,6 +265,7 @@ def make_baseline_update_fn(
         last_ts, late_dropped = st["last_ts"], st["late_dropped"]
         ewma_fast, ewma_slow = st["ewma_fast"], st["ewma_slow"]
         ewma_div_ms, ewma_n = st["ewma_div_ms"], st["ewma_n"]
+        rate_dt_ms, rate_n = st["rate_dt_ms"], st["rate_n"]
         cusum_up, cusum_down, cusum_vol = st["cusum_up"], st["cusum_down"], st["cusum_vol"]
         cusum_prev_price, cusum_diff_ms = st["cusum_prev_price"], st["cusum_diff_ms"]
         cusum_logv_mean, cusum_logv_var, cusum_n = st["cusum_logv_mean"], st["cusum_logv_var"], st["cusum_n"]
@@ -268,6 +282,7 @@ def make_baseline_update_fn(
                     late_dropped += 1
                     batch_late += 1
                     continue
+                prev_ts = last_ts
                 if last_ts is not None and row.event_time_ms - last_ts > gap_reset_ms:
                     # Overnight/weekend (or feed outage) gap: yesterday's
                     # close is no baseline for this morning's open, so both
@@ -280,7 +295,20 @@ def make_baseline_update_fn(
                     cusum_prev_price = None
                     cusum_diff_ms = cusum_logv_mean = cusum_logv_var = 0.0
                     cusum_n = 0
+                    rate_dt_ms, rate_n = 0.0, 0
+                    prev_ts = None
                 last_ts = row.event_time_ms
+
+                # Typical time between ticks for this ticker. Pauses are
+                # capped so a quiet stretch doesn't stretch the lookback.
+                if prev_ts is not None:
+                    dt = min(row.event_time_ms - prev_ts, rate_gap_cap_ms)
+                    rate_dt_ms = dt if rate_n == 0 else rate_dt_ms + alpha_rate * (dt - rate_dt_ms)
+                    rate_n += 1
+                if wash_lookback_ticks > 0 and rate_n >= rate_min_samples:
+                    lookback_ms = wash_lookback_ticks * rate_dt_ms
+                else:
+                    lookback_ms = wash_lookback_ms
 
                 # Ramp signal: fast EWMA (including this tick) minus the slow
                 # EWMA as of the previous tick, scaled by the divergence's RMS
@@ -299,11 +327,10 @@ def make_baseline_update_fn(
                 ewma_n += 1
                 is_ramp = ewma_div is not None and abs(ewma_div) > ewma_threshold
 
-
                 # Wash-trade heuristic, scored against ticks strictly before
                 # this one within the lookback (same-millisecond ticks are
                 # excluded, matching the original rangeBetween(-lookback, -1)).
-                cutoff = row.event_time_ms - wash_lookback_ms
+                cutoff = row.event_time_ms - lookback_ms
                 while wash_hist and wash_hist[0][0] < cutoff:
                     wash_hist.pop(0)
                 prior = [h for h in wash_hist if h[0] < row.event_time_ms]
@@ -480,6 +507,8 @@ def make_baseline_update_fn(
                         "ewma_slow": ewma_slow,
                         "ewma_div_ms": ewma_div_ms,
                         "ewma_n": ewma_n,
+                        "rate_dt_ms": rate_dt_ms,
+                        "rate_n": rate_n,
                     }
                 ),
                 float(cusum_up),
@@ -512,6 +541,8 @@ def detector_kwargs(args):
         wash_volume_ratio=args.wash_volume_ratio,
         wash_price_range=args.wash_price_range,
         wash_min_prior=args.wash_min_prior,
+        wash_lookback_ticks=args.wash_lookback_ticks,
+        rate_span=args.rate_span,
         gap_reset_ms=int(args.gap_reset_minutes * 60 * 1000),
         ewma_fast_span=args.ewma_fast_span,
         ewma_slow_span=args.ewma_slow_span,
@@ -694,6 +725,20 @@ def parse_args(argv=None):
         default=0.001,
         help="Max (max_price - min_price) / min_price across the trailing lookback for "
         "the market to count as flat (default 0.1%%)",
+    )
+    ap.add_argument(
+        "--wash-lookback-ticks",
+        type=float,
+        default=16.0,
+        help="If > 0, the wash lookback is this many ticks' worth of the ticker's "
+        "typical time between ticks (instead of --wash-lookback-seconds, which "
+        "still applies until that average has --rate-min-samples ticks)",
+    )
+    ap.add_argument(
+        "--rate-span",
+        type=float,
+        default=200.0,
+        help="Span (ticks) of the slow average of time between ticks",
     )
     ap.add_argument(
         "--wash-min-prior",

@@ -456,6 +456,35 @@ def test_gap_reset_also_resets_cusum_state():
     assert out["cusum_price"].isna().all()  # warming up again
 
 
+def test_wash_lookback_scales_to_the_tickers_trading_rate():
+    """With --wash-lookback-ticks, the lookback is K ticks' worth of the
+    ticker's typical spacing, not a fixed time: here 5 ticks at 1s apart =
+    5s, so a modest print is judged against the last few small trades
+    rather than a minute of earlier heavy volume."""
+    specs = [(100.0, 1000.0)] * 20 + [(100.0, 10.0)] * 5 + [(100.0, 30.0)]
+    fixed = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9)
+    scaled = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, wash_lookback_ticks=5
+    )
+    out_fixed, _ = run(fixed, make_ticks(specs))
+    out_scaled, state = run(scaled, make_ticks(specs))
+    assert out_fixed.iloc[-1]["anomaly_type"] != "wash_trade"  # 30 vs 0.3 x ~20k trailing volume
+    assert out_scaled.iloc[-1]["anomaly_type"] == "wash_trade"  # 30 vs 0.3 x 50
+    assert abs(load_state(state)["rate_dt_ms"] - 1000.0) < 1e-6
+
+
+def test_gap_reset_also_resets_the_trading_rate():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    close_ms = 1_700_000_000_000
+    _, state = run(fn, make_ticks([(100.0, 100.0)] * 30, start_ms=close_ms, step_ms=2000))
+    assert load_state(state)["rate_n"] == 29
+    open_ms = close_ms + 60_000 + int(17.5 * 3600 * 1000)
+    _, state = run(fn, make_ticks([(100.0, 100.0)] * 3, start_ms=open_ms, step_ms=500), state=state)
+    st = load_state(state)
+    assert st["rate_n"] == 2
+    assert st["rate_dt_ms"] < 1000.0  # morning spacing only, no overnight gap
+
+
 def test_checkpoint_path_includes_state_layout_version():
     path = checkpoint_path("./checkpoints/detect_anomalies/", "baseline")
     assert path == f"./checkpoints/detect_anomalies/state-v{STATE_LAYOUT_VERSION}/baseline"
