@@ -33,6 +33,15 @@ across micro-batches rather than restarting cold at every batch boundary:
    fast average away from the slow one before any single tick looks
    extreme. Flags anomaly_type="price_shock" (the price-anomaly family).
 
+4. CUSUM detectors. Price: a two-sided CUSUM of tick-to-tick price
+   changes, standardized by a slow RMS of those changes -- persistent
+   small moves in one direction add up (ramps). Volume: a one-sided CUSUM
+   of standardized log-volume above its slow average, accumulated only
+   while the trailing price range stays flat (--wash-price-range) and
+   reset as soon as price moves -- many modestly-large prints into a flat
+   market add up (wash trades split into normal-sized pieces). Price
+   CUSUM flags "price_shock", volume CUSUM "wash_trade".
+
 Both detectors start cold after a gap longer than --gap-reset-minutes
 (overnight/weekend), so the morning open isn't scored against yesterday's
 close. A tick older than one already processed for its ticker (i.e. it
@@ -60,6 +69,7 @@ Run with spark-submit so the Kafka connector package resolves, e.g.:
 """
 
 import argparse
+import math
 import pickle
 import sys
 
@@ -103,6 +113,8 @@ OUTPUT_SCHEMA = StructType(
         StructField("anomaly_type", StringType(), True),
         # --- added fields (appended; the ones above are unchanged)
         StructField("ewma_divergence", DoubleType(), True),
+        StructField("cusum_price", DoubleType(), True),
+        StructField("cusum_volume", DoubleType(), True),
     ]
 )
 OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
@@ -114,7 +126,30 @@ OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
 # 'elementType' out of pyspark.sql.types.ArrayType.fromJson -- reproduced
 # against a real Kafka source, not just a theoretical concern). Pickling the
 # window into BinaryType sidesteps that nested-type schema path entirely.
-BASELINE_STATE_SCHEMA = StructType([StructField("blob", BinaryType())])
+#
+# STATE_LAYOUT_VERSION is part of the checkpoint path (see checkpoint_path).
+# Spark stores each stateful query's state schema in its checkpoint and
+# refuses to restart against a different one, so bump this whenever
+# BASELINE_STATE_SCHEMA -- or what the detector keeps in state -- changes;
+# the job then starts from a fresh checkpoint directory instead of failing
+# on the old one. v1: pickled blob only. v2: blob + typed CUSUM fields.
+STATE_LAYOUT_VERSION = 2
+#
+# CUSUM state is kept as plain typed fields next to the blob (scalars only,
+# so the ArrayType problem above doesn't apply).
+CUSUM_STATE_FIELDS = [
+    ("cusum_up", DoubleType()),  # price CUSUM, upward
+    ("cusum_down", DoubleType()),  # price CUSUM, downward
+    ("cusum_vol", DoubleType()),  # volume CUSUM (flat-market gated)
+    ("cusum_prev_price", DoubleType()),  # last tick's price, for the tick diff
+    ("cusum_diff_ms", DoubleType()),  # slow EW mean square of (clipped) tick diffs
+    ("cusum_logv_mean", DoubleType()),  # slow EW mean of log volume
+    ("cusum_logv_var", DoubleType()),  # slow EW variance of log volume
+    ("cusum_n", LongType()),  # ticks since the last reset
+]
+BASELINE_STATE_SCHEMA = StructType(
+    [StructField("blob", BinaryType())] + [StructField(name, t, True) for name, t in CUSUM_STATE_FIELDS]
+)
 
 # Earlier versions of this job pickled a positional tuple; these were its
 # fields, in order (the 5-field layout predates wash_hist).
@@ -143,21 +178,38 @@ def empty_state():
         "ewma_slow": None,
         "ewma_div_ms": 0.0,
         "ewma_n": 0,
+        **empty_cusum_state(),
+    }
+
+
+def empty_cusum_state():
+    return {
+        "cusum_up": 0.0,
+        "cusum_down": 0.0,
+        "cusum_vol": 0.0,
+        "cusum_prev_price": None,
+        "cusum_diff_ms": 0.0,
+        "cusum_logv_mean": 0.0,
+        "cusum_logv_var": 0.0,
+        "cusum_n": 0,
     }
 
 
 def load_state(state):
-    """Unpickles the state blob into a dict, filling fields that older
-    checkpoints didn't have (a dict, so new fields don't need another
-    positional layout)."""
+    """State as one dict: the unpickled blob plus the typed CUSUM fields.
+    Fills fields that older layouts didn't have (a one-field state holding
+    a pickled tuple or dict, before the typed fields existed)."""
     st = empty_state()
     if state.exists:
-        (blob,) = state.get
+        blob, *typed = state.get
         saved = pickle.loads(blob)
         if isinstance(saved, dict):
             st.update(saved)
         else:
             st.update(zip(_LEGACY_STATE_FIELDS, saved))
+        for (name, _t), value in zip(CUSUM_STATE_FIELDS, typed):
+            if value is not None:
+                st[name] = value
     return st
 
 
@@ -176,6 +228,12 @@ def make_baseline_update_fn(
     ewma_slow_span=20,
     ewma_threshold=2.75,
     ewma_min_samples=50,
+    cusum_k=2.0,
+    cusum_h=6.0,
+    cusum_volume_k=0.75,
+    cusum_volume_h=3.0,
+    cusum_sigma_span=100,
+    cusum_min_samples=50,
 ):
     """Builds the per-ticker flatMapGroupsWithState function (PySpark:
     applyInPandasWithState). Closes over the tuned thresholds so they don't
@@ -185,6 +243,7 @@ def make_baseline_update_fn(
     alpha_slow = 2.0 / (ewma_slow_span + 1)
     # the divergence's RMS adapts at half the slow average's speed
     alpha_div = 2.0 / (2 * ewma_slow_span + 1)
+    alpha_sigma = 2.0 / (cusum_sigma_span + 1)
 
     def update_baseline(key, pdf_iter, state: GroupState):
         st = load_state(state)
@@ -193,6 +252,9 @@ def make_baseline_update_fn(
         last_ts, late_dropped = st["last_ts"], st["late_dropped"]
         ewma_fast, ewma_slow = st["ewma_fast"], st["ewma_slow"]
         ewma_div_ms, ewma_n = st["ewma_div_ms"], st["ewma_n"]
+        cusum_up, cusum_down, cusum_vol = st["cusum_up"], st["cusum_down"], st["cusum_vol"]
+        cusum_prev_price, cusum_diff_ms = st["cusum_prev_price"], st["cusum_diff_ms"]
+        cusum_logv_mean, cusum_logv_var, cusum_n = st["cusum_logv_mean"], st["cusum_logv_var"], st["cusum_n"]
         batch_late = 0
 
         rows_out = []
@@ -214,6 +276,10 @@ def make_baseline_update_fn(
                     sum_price = sum_sq = sum_pv = sum_v = 0.0
                     ewma_fast = ewma_slow = None
                     ewma_div_ms, ewma_n = 0.0, 0
+                    cusum_up = cusum_down = cusum_vol = 0.0
+                    cusum_prev_price = None
+                    cusum_diff_ms = cusum_logv_mean = cusum_logv_var = 0.0
+                    cusum_n = 0
                 last_ts = row.event_time_ms
 
                 # Ramp signal: fast EWMA (including this tick) minus the slow
@@ -233,6 +299,7 @@ def make_baseline_update_fn(
                 ewma_n += 1
                 is_ramp = ewma_div is not None and abs(ewma_div) > ewma_threshold
 
+
                 # Wash-trade heuristic, scored against ticks strictly before
                 # this one within the lookback (same-millisecond ticks are
                 # excluded, matching the original rangeBetween(-lookback, -1)).
@@ -241,6 +308,10 @@ def make_baseline_update_fn(
                     wash_hist.pop(0)
                 prior = [h for h in wash_hist if h[0] < row.event_time_ms]
                 is_wash_trade = False
+                flat_market = False
+                if prior:
+                    lo_p = min(h[1] for h in prior)
+                    flat_market = lo_p > 0 and (max(h[1] for h in prior) - lo_p) / lo_p < wash_price_range
                 # wash_min_prior (carried over from the old windowed version's
                 # --wash-min-events): with only 1-3 prior ticks, any ordinary
                 # tick is trivially >30% of the trailing volume
@@ -255,6 +326,43 @@ def make_baseline_update_fn(
                         and row.volume > wash_volume_ratio * prior_volume
                     )
                 wash_hist.append((row.event_time_ms, row.price, row.volume))
+
+                # CUSUMs. Each standardized step is clipped to clip_k (one
+                # shock can't carry a CUSUM alone), and the slow sigma/volume
+                # statistics are updated AFTER scoring, from clipped values.
+                cusum_price_out = cusum_volume_out = None
+                log_v = math.log(row.volume) if row.volume > 0 else None
+                if cusum_prev_price is not None:
+                    diff = row.price - cusum_prev_price
+                    sigma = cusum_diff_ms**0.5
+                    if sigma > 1e-12:
+                        step = max(-clip_k, min(clip_k, diff / sigma))
+                        cusum_up = max(0.0, cusum_up + step - cusum_k)
+                        cusum_down = max(0.0, cusum_down - step - cusum_k)
+                        diff = step * sigma
+                    cusum_diff_ms += (alpha_sigma if cusum_n > 1 else 1.0) * (diff * diff - cusum_diff_ms)
+                if log_v is not None:
+                    sd_v = cusum_logv_var**0.5
+                    if not flat_market:
+                        cusum_vol = 0.0
+                    elif cusum_n > 1 and sd_v > 1e-12:
+                        step_v = max(-clip_k, min(clip_k, (log_v - cusum_logv_mean) / sd_v))
+                        cusum_vol = max(0.0, cusum_vol + step_v - cusum_volume_k)
+                        log_v = cusum_logv_mean + step_v * sd_v
+                    if cusum_n == 0:
+                        cusum_logv_mean = log_v
+                    else:
+                        delta = log_v - cusum_logv_mean
+                        cusum_logv_mean += alpha_sigma * delta
+                        cusum_logv_var = (1 - alpha_sigma) * (cusum_logv_var + alpha_sigma * delta * delta)
+                cusum_prev_price = row.price
+                cusum_n += 1
+                cusum_warm = cusum_n > cusum_min_samples
+                if cusum_warm:
+                    cusum_price_out = max(cusum_up, cusum_down)
+                    cusum_volume_out = cusum_vol
+                is_cusum_price = cusum_warm and cusum_price_out > cusum_h
+                is_cusum_volume = cusum_warm and cusum_volume_out > cusum_volume_h
 
                 n = len(window)
                 if n >= min_samples:
@@ -307,11 +415,11 @@ def make_baseline_update_fn(
                     clipped_price = row.price
 
                 # the ramp signal has its own warm-up (ewma_min_samples)
-                if is_ramp and not is_anomaly:
+                if (is_ramp or is_cusum_price) and not is_anomaly:
                     is_anomaly, anomaly_type = True, "price_shock"
 
                 # independent of the baseline's warm-up; price_shock wins ties
-                if is_wash_trade and not is_anomaly:
+                if (is_wash_trade or is_cusum_volume) and not is_anomaly:
                     is_anomaly, anomaly_type = True, "wash_trade"
 
                 rows_out.append(
@@ -325,6 +433,8 @@ def make_baseline_update_fn(
                         is_anomaly,
                         anomaly_type,
                         ewma_div,
+                        cusum_price_out,
+                        cusum_volume_out,
                     )
                 )
 
@@ -372,6 +482,14 @@ def make_baseline_update_fn(
                         "ewma_n": ewma_n,
                     }
                 ),
+                float(cusum_up),
+                float(cusum_down),
+                float(cusum_vol),
+                None if cusum_prev_price is None else float(cusum_prev_price),
+                float(cusum_diff_ms),
+                float(cusum_logv_mean),
+                float(cusum_logv_var),
+                int(cusum_n),
             )
         )
 
@@ -399,6 +517,12 @@ def detector_kwargs(args):
         ewma_slow_span=args.ewma_slow_span,
         ewma_threshold=args.ewma_threshold,
         ewma_min_samples=args.ewma_min_samples,
+        cusum_k=args.cusum_k,
+        cusum_h=args.cusum_h,
+        cusum_volume_k=args.cusum_volume_k,
+        cusum_volume_h=args.cusum_volume_h,
+        cusum_sigma_span=args.cusum_sigma_span,
+        cusum_min_samples=args.cusum_min_samples,
     )
 
 
@@ -439,12 +563,18 @@ def read_parsed_ticks(spark, args):
     )
 
 
+def checkpoint_path(checkpoint_dir, name):
+    """<checkpoint_dir>/state-v<STATE_LAYOUT_VERSION>/<name>: a state layout
+    change moves the query to a new directory automatically."""
+    return f"{checkpoint_dir.rstrip('/')}/state-v{STATE_LAYOUT_VERSION}/{name}"
+
+
 def build_sink(anomaly_df, args, name):
     """Wraps an {ticker, timestamp, price, volume, zscore, vwap_divergence,
     is_anomaly, anomaly_type}-shaped stream in a console or Kafka sink. `name`
     scopes the checkpoint directory under --checkpoint-dir.
     """
-    checkpoint_dir = f"{args.checkpoint_dir.rstrip('/')}/{name}"
+    checkpoint_dir = checkpoint_path(args.checkpoint_dir, name)
     if args.output_topic:
         sink = (
             anomaly_df.select(
@@ -582,6 +712,20 @@ def parse_args(argv=None):
                     help="Flag when |fast - slow| exceeds this many RMS of the recent divergence")
     ap.add_argument("--ewma-min-samples", type=int, default=50,
                     help="Ticks since the last reset before the ramp signal is scored")
+
+    # CUSUM detectors
+    ap.add_argument("--cusum-k", type=float, default=2.0,
+                    help="Price CUSUM allowance per tick, in tick-sigma units")
+    ap.add_argument("--cusum-h", type=float, default=6.0,
+                    help="Price CUSUM alarm level, in tick-sigma units")
+    ap.add_argument("--cusum-volume-k", type=float, default=0.75,
+                    help="Volume CUSUM allowance per tick, in log-volume sd units")
+    ap.add_argument("--cusum-volume-h", type=float, default=3.0,
+                    help="Volume CUSUM alarm level, in log-volume sd units")
+    ap.add_argument("--cusum-sigma-span", type=float, default=100.0,
+                    help="Span (ticks) of the slow tick-sigma and log-volume statistics")
+    ap.add_argument("--cusum-min-samples", type=int, default=50,
+                    help="Ticks since the last reset before the CUSUMs are scored")
 
     # stream hygiene
     ap.add_argument(

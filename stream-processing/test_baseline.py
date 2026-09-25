@@ -10,10 +10,17 @@ Run with: python -m pytest test_baseline.py -v
 """
 import pickle
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from detect_anomalies import load_state, make_baseline_update_fn
+from detect_anomalies import (
+    CUSUM_STATE_FIELDS,
+    STATE_LAYOUT_VERSION,
+    checkpoint_path,
+    load_state,
+    make_baseline_update_fn,
+)
 
 
 def std_from_state(state):
@@ -246,19 +253,22 @@ def test_wash_history_round_trips_across_batches():
 @pytest.mark.parametrize("n_fields", [5, 6])
 def test_resumes_from_legacy_tuple_state_blob(n_fields):
     """Checkpoints written by earlier versions hold a positional tuple (5
-    fields before the wash-trade detector moved in, 6 after); both must
-    still load, and be re-saved in the current dict layout."""
+    fields before the wash-trade detector moved in, 6 after) in a one-field
+    state; both must still load, and be re-saved in the current layout: a
+    pickled dict plus the typed CUSUM fields."""
     fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
     state = FakeState()
     legacy = ([(100.0, 100.0, 100.0)] * 12, 1200.0, 120000.0, 120000.0, 1200.0, [])[:n_fields]
     state.update((pickle.dumps(legacy),))
     out, state = run(fn, make_ticks([(100.0, 100.0)]), state=state)
     assert out.iloc[0]["zscore"] is not None, "resumed baseline should already be warm"
-    (blob,) = state.get
+    blob, *typed = state.get
     saved = pickle.loads(blob)
     assert isinstance(saved, dict)
     assert len(saved["window"]) == 13
     assert saved["late_dropped"] == 0
+    assert len(typed) == len(CUSUM_STATE_FIELDS)
+    assert typed[-1] == 1  # cusum_n: the legacy state had no CUSUM history
 
 
 # --- overnight gap reset
@@ -369,6 +379,86 @@ def test_replay_with_shuffled_stragglers_drops_exactly_the_late_ones():
 
     assert load_state(state)["late_dropped"] == 4
     assert emitted == 300 - 4
+
+
+# --- CUSUM detectors (typed state)
+
+
+def noisy(base, n, step=0.01, seed=0):
+    """Alternating +/- step around `base` with a little seeded jitter, so the
+    slow tick-sigma and log-volume statistics are non-degenerate."""
+    rng = np.random.default_rng(seed)
+    return [base + (step if i % 2 == 0 else -step) + rng.normal(0, step / 4) for i in range(n)]
+
+
+def test_cusum_state_is_typed_fields_not_pickle():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    _, state = run(fn, make_ticks([(p, 100.0) for p in noisy(100.0, 30)]))
+    blob, *typed = state.get
+    assert len(typed) == len(CUSUM_STATE_FIELDS)
+    assert typed[-1] == 30  # cusum_n
+    assert not any(k.startswith("cusum_") for k in pickle.loads(blob))
+
+
+def test_price_cusum_flags_a_steady_ramp_after_warmup():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        cusum_k=0.5, cusum_h=8.0,
+    )
+    flat = noisy(100.0, 80)
+    ramp = [flat[-1] + 0.02 * (i + 1) for i in range(30)]  # ~2 tick-sigma per tick, one direction
+    out, _ = run(fn, make_ticks([(p, 100.0) for p in flat + ramp]))
+    assert not out.iloc[:80]["is_anomaly"].any()
+    assert out.iloc[80:]["anomaly_type"].eq("price_shock").any()
+    assert out.iloc[-1]["cusum_price"] > 8.0
+
+
+def test_volume_cusum_flags_split_prints_in_a_flat_market():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_h=1e9, cusum_volume_k=0.5, cusum_volume_h=5.0,
+    )
+    rng = np.random.default_rng(1)
+    calm = [(100.0 + rng.normal(0, 0.001), 100.0 * np.exp(rng.normal(0, 0.3))) for _ in range(80)]
+    split = [(100.0 + rng.normal(0, 0.001), 300.0) for _ in range(20)]  # 3x volume, no single outsized print
+    out, _ = run(fn, make_ticks(calm + split))
+    assert not out.iloc[:80]["is_anomaly"].any()
+    assert out.iloc[80:]["anomaly_type"].eq("wash_trade").any()
+
+
+def test_volume_cusum_resets_when_price_moves():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_h=1e9, cusum_volume_k=0.5, cusum_volume_h=5.0,
+    )
+    rng = np.random.default_rng(1)
+    calm = [(100.0 + rng.normal(0, 0.001), 100.0 * np.exp(rng.normal(0, 0.3))) for _ in range(80)]
+    # same elevated volume, but price swinging ~1%: not a flat market
+    moving = [(100.0 + (0.5 if i % 2 == 0 else -0.5), 300.0) for i in range(20)]
+    out, _ = run(fn, make_ticks(calm + moving))
+    assert (out.iloc[81:]["cusum_volume"] == 0).all()
+    assert not out.iloc[80:]["anomaly_type"].eq("wash_trade").any()
+
+
+def test_gap_reset_also_resets_cusum_state():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    close_ms = 1_700_000_000_000
+    close = make_ticks([(p, 100.0) for p in noisy(100.0, 60)], start_ms=close_ms)
+    _, state = run(fn, close)
+    assert load_state(state)["cusum_n"] == 60
+    open_ms = close_ms + 60 * 1000 + int(17.5 * 3600 * 1000)
+    morning = make_ticks([(p, 100.0) for p in noisy(110.0, 5)], start_ms=open_ms)
+    out, state = run(fn, morning, state=state)
+    st = load_state(state)
+    assert st["cusum_n"] == 5
+    # the overnight jump never enters a CUSUM: the diff chain restarts at the open
+    assert st["cusum_up"] < 1.0 and st["cusum_down"] < 1.0
+    assert out["cusum_price"].isna().all()  # warming up again
+
+
+def test_checkpoint_path_includes_state_layout_version():
+    path = checkpoint_path("./checkpoints/detect_anomalies/", "baseline")
+    assert path == f"./checkpoints/detect_anomalies/state-v{STATE_LAYOUT_VERSION}/baseline"
 
 
 if __name__ == "__main__":

@@ -266,6 +266,22 @@ most tick-level "false positives" are the later ticks of real bursts.
 
 ### Known limitations
 
+- **Injected ramps are about a one-standard-deviation move, which caps
+  any price-only detector.** Normal prices in this data trend: tick-to-
+  tick price changes have lag-1 autocorrelation +0.12 to +0.28, and over
+  15 ticks normal price changes have a standard deviation of 5-7x the
+  tick sigma (a random walk would give 3.9x). The injected ramps move a
+  total of 4-8 tick sigma, so a ramp looks like an ordinary one-sd
+  trend. Every price-only ramp signal tried here (fast-vs-slow EWMA,
+  price CUSUM, the rolling window against a slow EWMA) trades ramp
+  recall directly against false alarms on normal trending periods.
+- **The price CUSUM (k=2, h=6) is a small regression on the original
+  shocks.** It raises ramp F1 from 0.183 to 0.225 (per event, existing
+  variants) but lowers original price_shock F1 from 0.378 to 0.374
+  (precision 34.1% -> 33.1%, recall 42.3% -> 42.9%). At lower
+  allowances (k <= 1) it floods normal trending periods with flags
+  (original price_shock precision 2-16%).
+
 - **Slow or split manipulation goes largely undetected** (table 4).
   A ramp moves slowly enough that the 20-tick baseline follows it up, so
   it never stands out. Split prints never exceed 30% of the trailing
@@ -301,6 +317,23 @@ pip install -r requirements.txt
 ```
 
 Tested against PySpark 4.2.0 / Java 17.
+
+### Checkpoints: any change to detector state needs a fresh directory
+
+Spark writes each stateful query's state schema into its checkpoint and
+refuses to restart a query whose state schema has changed (and state
+that does load under a changed detector means something different from
+what the new code expects). So the job puts a state layout version in
+the checkpoint path: `--checkpoint-dir` (default
+`./checkpoints/detect_anomalies`) is used as
+`<dir>/state-v<STATE_LAYOUT_VERSION>/baseline`. **Bump
+`STATE_LAYOUT_VERSION` in `detect_anomalies.py` whenever
+`BASELINE_STATE_SCHEMA` or what the detector keeps in state changes**;
+the job then starts from a fresh directory instead of failing on the old
+one. A fresh checkpoint also means the query starts from
+`--starting-offsets` again and every ticker's baseline re-warms.
+Current version: 2 (pickled blob + typed CUSUM fields; v1 was the blob
+alone).
 
 ### Recommended: the Docker stack (known-working Kafka + Spark)
 

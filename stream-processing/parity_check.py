@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from detect_anomalies import detector_kwargs, make_baseline_update_fn, parse_args
+from detect_anomalies import checkpoint_path, detector_kwargs, make_baseline_update_fn, parse_args
 
 HERE = Path(__file__).resolve().parent
 DATA_PATH = HERE.parent / "data-ingestion" / "aapl_msft_googl_tsla_nvda_ticks_labeled.csv"
@@ -51,7 +51,7 @@ KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0"
 DEFAULT_SPARK_SUBMIT = "/usr/local/lib/python3.10/dist-packages/pyspark/bin/spark-submit"
 
 # output fields compared, beyond the (ticker, timestamp) join key
-FLOAT_FIELDS = ["price", "volume", "zscore", "vwap_divergence", "ewma_divergence"]
+FLOAT_FIELDS = ["price", "volume", "zscore", "vwap_divergence", "ewma_divergence", "cusum_price", "cusum_volume"]
 EXACT_FIELDS = ["is_anomaly", "anomaly_type"]
 
 
@@ -292,7 +292,7 @@ def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size):
         if spark.returncode:
             print(spark.stderr[-4000:], file=sys.stderr)
             sys.exit(f"spark-submit failed ({spark.returncode})")
-        commits = Path(checkpoint, "baseline", "commits")
+        commits = Path(checkpoint_path(checkpoint, "baseline"), "commits")
         n_batches = len([p for p in commits.iterdir() if p.name.isdigit()]) if commits.exists() else 0
         print(f"spark job committed {n_batches} micro-batches (<= {batch_size} records each)")
 
