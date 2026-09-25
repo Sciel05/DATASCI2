@@ -419,23 +419,44 @@ def trading_hours(df):
     return ((spans["max"] - spans["min"]) / 3_600_000).groupby(level=0).sum()
 
 
-def incident_metrics(df, out, events):
+def period_mask(df, period):
+    """Rows in the time-split period: all, train (first TRAIN_FRACTION of
+    the timeline) or test (the rest)."""
+    t = df["event_time_ms"].to_numpy()
+    if period == "all":
+        return np.ones(len(df), bool)
+    cutoff = np.quantile(t, TRAIN_FRACTION)
+    return t <= cutoff if period == "train" else t > cutoff
+
+
+def restrict(shock, wash, events, mask):
+    """Flags and events limited to a period: flags outside it are dropped,
+    and an event counts if it starts inside it."""
+    return shock & mask, wash & mask, [e for e in events if mask[e[0]]]
+
+
+def incident_metrics(df, out, events, mask=None):
     """Incident-level scores. An incident (flags sharing an incident_id) is
     correct if any of its ticks falls inside any anomaly span; an event is
     caught if any flagged tick falls inside its span. Returns overall
-    numbers and alerts (incidents) per trading hour per ticker."""
+    numbers, the flagged-tick rate, and alerts (incidents) per trading hour
+    per ticker. With `mask`, only that period's ticks and events count."""
     n = len(df)
+    if mask is None:
+        mask = np.ones(n, bool)
+    events = [e for e in events if mask[e[0]]]
     cover = np.zeros(n, bool)
     for s_, e_, _k in events:
         cover[s_:e_] = True
-    inc = out["incident_id"].to_numpy()
+    inc = np.where(mask, out["incident_id"].to_numpy(), None)
     flagged = pd.notna(inc)
     ids = pd.Series(inc[flagged])
     hit = pd.Series(cover[flagged]).groupby(ids.to_numpy()).any()
     caught = sum(flagged[s_:e_].any() for s_, e_, _k in events)
     per_ticker = pd.Series(hit.index).str.rsplit("-", n=1).str[0].value_counts()
-    hours = trading_hours(df)
+    hours = trading_hours(df[mask])
     return {
+        "flag_rate": float(out["is_anomaly"].to_numpy()[mask].astype(bool).mean()),
         "incidents": int(len(hit)),
         "precision": float(hit.mean()) if len(hit) else 0.0,
         "event_recall": caught / len(events) if events else 0.0,
@@ -446,13 +467,14 @@ def incident_metrics(df, out, events):
 
 def print_incident_rows(rows, tickers):
     head = " | ".join(f"{t:>5}" for t in tickers)
-    print(f"| {'dataset':<16} | {'incidents':>9} | {'incident precision':>18} | {'events caught':>13} | "
-          f"{'alerts/h/ticker':>15} | {head} |")
-    print(f"|{'-' * 18}|{'-' * 11}|{'-' * 20}|{'-' * 15}|{'-' * 17}|" + "|".join("-" * 7 for _ in tickers) + "|")
+    print(f"| {'dataset':<16} | {'flagged ticks':>13} | {'incidents':>9} | {'incident precision':>18} | "
+          f"{'events caught':>13} | {'alerts/h/ticker':>15} | {head} |")
+    print(f"|{'-' * 18}|{'-' * 15}|{'-' * 11}|{'-' * 20}|{'-' * 15}|{'-' * 17}|"
+          + "|".join("-" * 7 for _ in tickers) + "|")
     for name, m in rows:
         per = " | ".join(f"{m['alerts_per_hour'][t]:>5.1f}" for t in tickers)
-        print(f"| {name:<16} | {m['incidents']:>9,} | {m['precision']:>18.1%} | {m['event_recall']:>13.1%} | "
-              f"{m['total_per_hour']:>15.1f} | {per} |")
+        print(f"| {name:<16} | {m['flag_rate']:>13.2%} | {m['incidents']:>9,} | {m['precision']:>18.1%} | "
+              f"{m['event_recall']:>13.1%} | {m['total_per_hour']:>15.1f} | {per} |")
 
 
 def print_event_rows(rows):
@@ -468,32 +490,36 @@ def detector_flags(out):
     return types == "price_shock", types == "wash_trade"
 
 
-def variant_section(df, include_heldout, naive_thresholds=None):
+def variant_section(df, include_heldout, naive_thresholds=None, period="all", kwargs=None, quiet=False):
     """Section 4: per-event scores by anomaly type for the detector as the
-    Spark job runs it, on the original data and the harder variants (and the
-    held-out variants only when asked). With naive_thresholds, the naive
+    Spark job runs it (or with `kwargs`), on the original data and the
+    harder variants (and the held-out variants only when asked), limited to
+    one time-split `period`. With naive_thresholds, the naive
     fixed-threshold baseline is scored on the same datasets."""
     n = len(df)
-    kwargs = production_kwargs()
+    mask = period_mask(df, period)
+    kwargs = kwargs or production_kwargs()
     sets = [("original", df, original_events(df))]
     sets += [(k, d, original_events(d) + e) for k, d, e in variant_datasets(df, EXISTING_VARIANTS, SEED)]
     if include_heldout:
         sets += [(k, d, original_events(d) + e) for k, d, e in variant_datasets(df, HELDOUT_VARIANTS, HELDOUT_SEED)]
 
-    print("\n## 4. Per-event scores by anomaly type (detector at the job's defaults, all days)\n")
     det_rows, naive_rows, incident_rows = [], [], []
     for name, data, events in sets:
         kinds = ["price_shock", "wash_trade"] if name == "original" else [name]
         out = run_detector(data, kwargs)
-        res = event_metrics(*detector_flags(out), events, n)
+        res = event_metrics(*restrict(*detector_flags(out), events, mask), n)
         det_rows += [(VARIANT_LABELS[k], res[k]) for k in kinds]
-        incident_rows.append((name, incident_metrics(data, out, events)))
+        incident_rows.append((name, incident_metrics(data, out, events, mask)))
         if naive_thresholds is not None:
             ret, vol = naive_features(data)
             naive_shock = ret > naive_thresholds[0]
             naive_wash = (vol > naive_thresholds[1]) & ~naive_shock
-            res = event_metrics(naive_shock, naive_wash, events, n)
+            res = event_metrics(*restrict(naive_shock, naive_wash, events, mask), n)
             naive_rows += [(VARIANT_LABELS[k], res[k]) for k in kinds]
+    if quiet:
+        return det_rows, naive_rows, incident_rows
+    print(f"\n## 4. Per-event scores by anomaly type (detector at the job's defaults, period: {period})\n")
     print_event_rows(det_rows)
     print("\nIncidents (consecutive flags on a ticker grouped by incident_id; alerts = incidents"
           " per trading hour, overall as the average per ticker; each dataset holds the original anomalies plus its variant):\n")
@@ -514,6 +540,8 @@ def main():
     ap.add_argument("--heldout", action="store_true",
                     help="also score the held-out variant set in section 4 (never use for tuning)")
     ap.add_argument("--naive", action="store_true", help="also score the naive baseline in section 4")
+    ap.add_argument("--period", choices=["all", "train", "test"], default="all",
+                    help="section 4: score only this part of the time split (tune on train only)")
     cli = ap.parse_args()
 
     df = load_data()
@@ -539,7 +567,7 @@ def main():
     if "split" in cli.sections:
         split_sections(df, labels, train, test, job, naive_thresholds)
     if "variants" in cli.sections:
-        variant_section(df, cli.heldout, naive_thresholds if cli.naive else None)
+        variant_section(df, cli.heldout, naive_thresholds if cli.naive else None, cli.period)
 
 
 def split_sections(df, labels, train, test, job, naive_thresholds):
