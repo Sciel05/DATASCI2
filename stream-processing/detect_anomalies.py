@@ -483,6 +483,17 @@ def make_baseline_update_fn(
                     anomaly_type = None
                 signals = ",".join(fired) if fired else None
 
+                # A CUSUM restarts from zero once it fires, so a burst raises
+                # one alarm per accumulation instead of one per tick; this
+                # tick's output keeps the value that fired.
+                if "cusum_price" in fired:
+                    if cusum_up / cusum_h > risk_threshold:
+                        cusum_up = 0.0
+                    if cusum_down / cusum_h > risk_threshold:
+                        cusum_down = 0.0
+                if "cusum_volume" in fired:
+                    cusum_vol = 0.0
+
                 # Incidents: consecutive flags at most incident_gap_ticks
                 # unflagged ticks apart share an id.
                 if is_anomaly:

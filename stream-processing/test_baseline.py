@@ -410,7 +410,35 @@ def test_price_cusum_flags_a_steady_ramp_after_warmup():
     out, _ = run(fn, make_ticks([(p, 100.0) for p in flat + ramp]))
     assert not out.iloc[:80]["is_anomaly"].any()
     assert out.iloc[80:]["anomaly_type"].eq("price_shock").any()
-    assert out.iloc[-1]["cusum_price"] > 8.0
+
+
+def test_cusums_restart_from_zero_after_firing():
+    """A CUSUM that fires restarts at zero, so a long ramp or burst raises
+    one alarm per accumulation instead of one per tick."""
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_k=0.5, cusum_h=8.0, cusum_volume_k=0.5, cusum_volume_h=5.0,
+    )
+    flat = noisy(100.0, 80)
+    ramp = [flat[-1] + 0.02 * (i + 1) for i in range(60)]
+    out, _ = run(fn, make_ticks([(p, 100.0) for p in flat + ramp]))
+    fires = np.flatnonzero(out["signals"].fillna("").str.contains("cusum_price").to_numpy())
+    assert len(fires) >= 2
+    assert len(fires) < 60 / 4  # nowhere near one alarm per ramp tick
+    for i in fires:
+        assert out.loc[i, "cusum_price"] > 8.0  # the output keeps the value that fired
+        if i + 1 < len(out):
+            assert out.loc[i + 1, "cusum_price"] < 8.0  # restarted
+
+    rng = np.random.default_rng(1)
+    calm = [(100.0 + rng.normal(0, 0.001), 100.0 * np.exp(rng.normal(0, 0.3))) for _ in range(80)]
+    burst = [(100.0 + rng.normal(0, 0.001), 300.0) for _ in range(40)]
+    out, _ = run(fn, make_ticks(calm + burst))
+    vfires = np.flatnonzero(out["signals"].fillna("").str.contains("cusum_volume").to_numpy())
+    assert 1 <= len(vfires) < 40 / 2
+    for i in vfires:
+        if i + 1 < len(out):
+            assert out.loc[i + 1, "cusum_volume"] < 5.0
 
 
 def test_volume_cusum_flags_split_prints_in_a_flat_market():
