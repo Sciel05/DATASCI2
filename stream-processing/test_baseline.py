@@ -553,6 +553,21 @@ def test_gap_reset_closes_the_open_incident():
     assert load_state(state)["incident_id"] is None
 
 
+def test_tick_id_is_unique_and_stable_across_batches():
+    ticks = make_ticks([(100.0, 100.0)] * 6)
+    ticks.loc[3, "event_time_ms"] = ticks.loc[2, "event_time_ms"]  # two ticks in one millisecond
+    ticks.loc[4, "event_time_ms"] = ticks.loc[2, "event_time_ms"]
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    whole, _ = run(fn, ticks)
+    ms = int(ticks.loc[2, "event_time_ms"])
+    assert whole["tick_id"].tolist()[2:5] == [f"AAPL-{ms}-0", f"AAPL-{ms}-1", f"AAPL-{ms}-2"]
+    assert whole["tick_id"].is_unique
+    # split mid-millisecond: the sequence continues from state
+    first, state = run(fn, ticks.iloc[:4])
+    second, _ = run(fn, ticks.iloc[4:].reset_index(drop=True), state=state)
+    assert first["tick_id"].tolist() + second["tick_id"].tolist() == whole["tick_id"].tolist()
+
+
 def test_checkpoint_path_includes_state_layout_version():
     path = checkpoint_path("./checkpoints/detect_anomalies/", "baseline")
     assert path == f"./checkpoints/detect_anomalies/state-v{STATE_LAYOUT_VERSION}/baseline"

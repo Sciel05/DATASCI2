@@ -54,7 +54,7 @@ DEFAULT_SPARK_SUBMIT = "/usr/local/lib/python3.10/dist-packages/pyspark/bin/spar
 FLOAT_FIELDS = [
     "price", "volume", "zscore", "vwap_divergence", "ewma_divergence", "cusum_price", "cusum_volume", "risk_score",
 ]
-EXACT_FIELDS = ["is_anomaly", "anomaly_type", "signals", "incident_id"]
+EXACT_FIELDS = ["is_anomaly", "anomaly_type", "signals", "incident_id", "tick_id"]
 
 
 class FakeState:

@@ -131,6 +131,11 @@ OUTPUT_SCHEMA = StructType(
         StructField("risk_score", DoubleType(), True),
         StructField("signals", StringType(), True),
         StructField("incident_id", StringType(), True),
+        # "<ticker>-<event_time_ms>-<seq>": seq counts earlier ticks of this
+        # ticker in the same millisecond (normally 0). Deterministic for a
+        # given input -- a retried micro-batch restarts from the committed
+        # state -- so a sink keyed on it overwrites instead of duplicating.
+        StructField("tick_id", StringType(), True),
     ]
 )
 OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
@@ -151,7 +156,8 @@ OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
 # on the old one. v1: pickled blob only. v2: blob + typed CUSUM fields.
 # v3: typical time between ticks (rate_dt_ms, rate_n) in the blob.
 # v4: open incident (incident_id, ticks_since_flag) in the blob.
-STATE_LAYOUT_VERSION = 4
+# v5: same_ts_seq (tick_id sequence within a millisecond) in the blob.
+STATE_LAYOUT_VERSION = 5
 #
 # CUSUM state is kept as plain typed fields next to the blob (scalars only,
 # so the ArrayType problem above doesn't apply).
@@ -202,6 +208,8 @@ def empty_state():
         # open incident: its id and unflagged ticks since its last flag
         "incident_id": None,
         "ticks_since_flag": 0,
+        # ticks already seen at last_ts, for tick_id
+        "same_ts_seq": 0,
         **empty_cusum_state(),
     }
 
@@ -285,6 +293,7 @@ def make_baseline_update_fn(
         ewma_div_ms, ewma_n = st["ewma_div_ms"], st["ewma_n"]
         rate_dt_ms, rate_n = st["rate_dt_ms"], st["rate_n"]
         incident_id, ticks_since_flag = st["incident_id"], st["ticks_since_flag"]
+        same_ts_seq = st["same_ts_seq"]
         cusum_up, cusum_down, cusum_vol = st["cusum_up"], st["cusum_down"], st["cusum_vol"]
         cusum_prev_price, cusum_diff_ms = st["cusum_prev_price"], st["cusum_diff_ms"]
         cusum_logv_mean, cusum_logv_var, cusum_n = st["cusum_logv_mean"], st["cusum_logv_var"], st["cusum_n"]
@@ -317,6 +326,8 @@ def make_baseline_update_fn(
                     rate_dt_ms, rate_n = 0.0, 0
                     prev_ts = None
                     incident_id, ticks_since_flag = None, 0
+                same_ts_seq = same_ts_seq + 1 if row.event_time_ms == prev_ts else 0
+                tick_id = f"{row.ticker}-{int(row.event_time_ms)}-{same_ts_seq}"
                 last_ts = row.event_time_ms
 
                 # Typical time between ticks for this ticker. Pauses are
@@ -499,6 +510,7 @@ def make_baseline_update_fn(
                         float(risk_score),
                         signals,
                         tick_incident,
+                        tick_id,
                     )
                 )
 
@@ -548,6 +560,7 @@ def make_baseline_update_fn(
                         "rate_n": rate_n,
                         "incident_id": incident_id,
                         "ticks_since_flag": ticks_since_flag,
+                        "same_ts_seq": same_ts_seq,
                     }
                 ),
                 float(cusum_up),
