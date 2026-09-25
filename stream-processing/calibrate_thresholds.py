@@ -13,15 +13,17 @@ test_baseline.py and the README's "Evaluating against ground truth"
 section -- never fed into the detector itself.
 
 Two-stage sweep (the full cross product isn't necessary):
-  1. z_threshold in [1.5 .. 6.0] at the current default vwap_threshold --
-     wide enough to find where F1 actually peaks (z=4.0) rather than just
-     hit the edge of a narrower range.
-  2. vwap_threshold in [0.005, 0.01, 0.015] at z=3.5 -- NOT at the z=4.0
-     F1-optimum. z=3.5 is detect_anomalies.py's chosen production default:
-     close to the F1 peak but recall-favoring (a missed price_shock costs
-     more than an extra alert an analyst dismisses, for this surveillance
-     use case). See stream-processing/README.md's Calibration section for
-     the full reasoning.
+  1. z_threshold in [3.0 .. 7.0] at the current default vwap_threshold --
+     wide enough to find where F1 actually peaks rather than just hit the
+     edge of a narrower range.
+  2. vwap_threshold in [0.005, 0.01, 0.015] at the production z_threshold.
+     See stream-processing/README.md's Calibration section for why the
+     production default sits on the recall side of the F1 peak.
+
+Price-shock precision/recall count only anomaly_type == "price_shock"
+flags, so the wash-trade detector (which shares the same state function)
+isn't scored as price-shock false positives. Wash-trade and combined
+numbers are reported alongside.
 
 window_size, min_samples, and clip_k are held at detect_anomalies.py's
 current defaults throughout -- this sweep is scoped to the two flagging
@@ -31,23 +33,31 @@ only reports numbers.
 Run with: python calibrate_thresholds.py
 """
 
+from pathlib import Path
+
 import pandas as pd
 
 from detect_anomalies import make_baseline_update_fn
 
-DATA_PATH = r"C:\Users\Lenovo\DATASCI2\data-ingestion\aapl_msft_googl_tsla_nvda_ticks_labeled.csv"
+# resolved relative to this file, so it works natively and inside the Docker
+# container (where the repo is mounted at /workspace)
+DATA_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "data-ingestion"
+    / "aapl_msft_googl_tsla_nvda_ticks_labeled.csv"
+)
 
-WINDOW_SIZE = 100
-MIN_SAMPLES = 30
+WINDOW_SIZE = 20
+MIN_SAMPLES = 10
 CLIP_K = 5.0
 
 DEFAULT_VWAP_THRESHOLD = 0.01
 # The chosen production default (detect_anomalies.py --zscore-threshold) --
-# deliberately not the pure F1-optimal z=4.0 found by the sweep below. See
-# the module docstring and README.md's Calibration section for why.
-PRODUCTION_Z_THRESHOLD = 3.5
+# deliberately on the recall side of the F1 peak found by the sweep below.
+# See README.md's Calibration section for why.
+PRODUCTION_Z_THRESHOLD = 5.0
 
-Z_SWEEP = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0]
+Z_SWEEP = [3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0]
 VWAP_SWEEP = [0.005, 0.01, 0.015]
 
 
@@ -94,11 +104,16 @@ def run_detector(df, z_threshold, vwap_threshold):
     return pd.concat(results, ignore_index=True)
 
 
-def score(full):
-    tp = ((full["is_anomaly"]) & (full["label"] == "price_shock")).sum()
-    fp = ((full["is_anomaly"]) & (full["label"] != "price_shock")).sum()
-    total_flagged = full["is_anomaly"].sum()
-    total_shock = (full["label"] == "price_shock").sum()
+def score(full, flagged=None, positive=None):
+    """Defaults to scoring the price-shock detector against price_shock labels."""
+    if flagged is None:
+        flagged = full["anomaly_type"] == "price_shock"
+    if positive is None:
+        positive = full["label"] == "price_shock"
+    tp = (flagged & positive).sum()
+    fp = (flagged & ~positive).sum()
+    total_flagged = flagged.sum()
+    total_shock = positive.sum()
     precision = tp / total_flagged if total_flagged else 0.0
     recall = tp / total_shock if total_shock else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
@@ -157,8 +172,21 @@ def main():
           f"(F1={best_v_score['f1']:.4f}, precision={best_v_score['precision']:.2%}, "
           f"recall={best_v_score['recall']:.2%})\n")
 
+    full = run_detector(df, PRODUCTION_Z_THRESHOLD, DEFAULT_VWAP_THRESHOLD)
+    print(f"=== Production defaults (z={PRODUCTION_Z_THRESHOLD}, vwap={DEFAULT_VWAP_THRESHOLD}): "
+          f"every detector ===\n")
+    print_table(
+        [
+            ("price_shock", score(full)),
+            ("wash_trade", score(full, full["anomaly_type"] == "wash_trade", full["label"] == "wash_trade")),
+            ("any anomaly", score(full, full["is_anomaly"].astype(bool), full["label"] != "normal")),
+        ],
+        "detector",
+    )
+
     print("Note: this only reports numbers -- detect_anomalies.py's defaults are unchanged by this script.")
 
 
 if __name__ == "__main__":
     main()
+

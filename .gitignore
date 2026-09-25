@@ -10,4 +10,5 @@ venv/
 # Spark/Cassandra local run artifacts (Objectives 2-3, once those exist)
 spark-warehouse/
 checkpoint/
+checkpoints/
 *.log

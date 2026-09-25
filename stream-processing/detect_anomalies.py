@@ -7,20 +7,25 @@ data-ingestion/producer.py produces and emits an anomaly-annotated
 stream: {ticker, timestamp, price, volume, zscore, vwap_divergence,
 is_anomaly, anomaly_type}.
 
-Two independent detectors feed the same output stream:
+Both detectors run inside one per-ticker stateful function, via
+applyInPandasWithState -- PySpark's arbitrary-state API, the equivalent
+of Scala's flatMapGroupsWithState -- so each keeps its trailing history
+across micro-batches rather than restarting cold at every batch boundary:
 
-1. Statistical baseline (per-ticker rolling Z-score + VWAP divergence),
-   via applyInPandasWithState -- PySpark's arbitrary-state API, the
-   equivalent of Scala's flatMapGroupsWithState. Keyed by ticker, it
-   keeps a trailing window of the last --baseline-window ticks and
+1. Statistical baseline (per-ticker rolling Z-score + VWAP divergence).
+   Keeps a trailing window of the last --baseline-window ticks and
    recomputes mean/stddev/VWAP from that window on every event, so the
    baseline tracks each asset's own recent behavior rather than a fixed
    session-wide statistic. Flags anomaly_type="price_shock".
 
-2. Wash-trade heuristic: a separate tumbling-window aggregation
-   (high volume + near-zero net price movement in a short window).
-   Explicitly a simplified heuristic per the README, not a validated
-   detector. Flags anomaly_type="wash_trade".
+2. Wash-trade heuristic (adapted from the Frank-stream-processing
+   branch): a tick is flagged when the ticker's trailing
+   --wash-lookback-seconds of ticks moved in price by less than
+   --wash-price-range, yet this single tick's volume exceeds
+   --wash-volume-ratio of that whole trailing volume -- i.e. a large
+   print into a flat market (needs at least --wash-min-prior prior ticks). Explicitly a simplified heuristic per the
+   README, not a validated detector. Flags anomaly_type="wash_trade"
+   (price_shock takes precedence if both fire on the same tick).
 
 `label` is present in the Kafka payload for evaluation only (see
 data-ingestion/README.md and stream-processing/README.md) and is
@@ -64,7 +69,6 @@ TICK_SCHEMA = StructType(
         StructField("event_time_ms", LongType()),
         StructField("price", DoubleType()),
         StructField("volume", DoubleType()),
-        StructField("side", StringType()),
         StructField("bid", DoubleType(), True),
         StructField("ask", DoubleType(), True),
         # ground truth only -- dropped right after parsing, never used
@@ -96,7 +100,17 @@ OUTPUT_SCHEMA = StructType(
 BASELINE_STATE_SCHEMA = StructType([StructField("blob", BinaryType())])
 
 
-def make_baseline_update_fn(window_size, min_samples, z_threshold, vwap_threshold, clip_k=5.0):
+def make_baseline_update_fn(
+    window_size,
+    min_samples,
+    z_threshold,
+    vwap_threshold,
+    clip_k=5.0,
+    wash_lookback_ms=120_000,
+    wash_volume_ratio=0.3,
+    wash_price_range=0.001,
+    wash_min_prior=4,
+):
     """Builds the per-ticker flatMapGroupsWithState function (PySpark:
     applyInPandasWithState). Closes over the tuned thresholds so they don't
     need to be threaded through Spark's fixed (key, pdf_iter, state) signature.
@@ -107,14 +121,45 @@ def make_baseline_update_fn(window_size, min_samples, z_threshold, vwap_threshol
             (blob,) = state.get
             # window: list of (raw_price, clipped_price, volume) -- see the
             # bounded-influence comment below for why raw and clipped diverge.
-            window, sum_price, sum_sq, sum_pv, sum_v = pickle.loads(blob)
+            # wash_hist: list of (event_time_ms, price, volume) covering the
+            # trailing wash_lookback_ms, for the wash-trade heuristic.
+            saved = pickle.loads(blob)
+            if len(saved) == 5:
+                # state checkpointed before the wash-trade detector moved in
+                # here -- resume the baseline, start the wash history empty
+                saved = (*saved, [])
+            window, sum_price, sum_sq, sum_pv, sum_v, wash_hist = saved
         else:
             window = []
             sum_price = sum_sq = sum_pv = sum_v = 0.0
+            wash_hist = []
 
         rows_out = []
         for pdf in pdf_iter:
             for row in pdf.sort_values("event_time_ms").itertuples(index=False):
+                # Wash-trade heuristic, scored against ticks strictly before
+                # this one within the lookback (same-millisecond ticks are
+                # excluded, matching the original rangeBetween(-lookback, -1)).
+                cutoff = row.event_time_ms - wash_lookback_ms
+                while wash_hist and wash_hist[0][0] < cutoff:
+                    wash_hist.pop(0)
+                prior = [h for h in wash_hist if h[0] < row.event_time_ms]
+                is_wash_trade = False
+                # wash_min_prior (carried over from the old windowed version's
+                # --wash-min-events): with only 1-3 prior ticks, any ordinary
+                # tick is trivially >30% of the trailing volume
+                if len(prior) >= max(wash_min_prior, 1):
+                    prior_volume = sum(h[2] for h in prior)
+                    lo = min(h[1] for h in prior)
+                    hi = max(h[1] for h in prior)
+                    is_wash_trade = bool(
+                        prior_volume > 0
+                        and lo > 0
+                        and (hi - lo) / lo < wash_price_range
+                        and row.volume > wash_volume_ratio * prior_volume
+                    )
+                wash_hist.append((row.event_time_ms, row.price, row.volume))
+
                 n = len(window)
                 if n >= min_samples:
                     mean = sum_price / n
@@ -165,6 +210,10 @@ def make_baseline_update_fn(window_size, min_samples, z_threshold, vwap_threshol
                     zscore, vwap_div, is_anomaly, anomaly_type = None, None, False, None
                     clipped_price = row.price
 
+                # independent of the baseline's warm-up; price_shock wins ties
+                if is_wash_trade and not is_anomaly:
+                    is_anomaly, anomaly_type = True, "wash_trade"
+
                 rows_out.append(
                     (
                         row.ticker,
@@ -196,7 +245,7 @@ def make_baseline_update_fn(window_size, min_samples, z_threshold, vwap_threshol
                     sum_pv -= old_raw * old_vol
                     sum_v -= old_vol
 
-        state.update((pickle.dumps((window, sum_price, sum_sq, sum_pv, sum_v)),))
+        state.update((pickle.dumps((window, sum_price, sum_sq, sum_pv, sum_v, wash_hist)),))
 
         yield pd.DataFrame(
             rows_out,
@@ -222,6 +271,10 @@ def build_baseline_stream(parsed, args):
         z_threshold=args.zscore_threshold,
         vwap_threshold=args.vwap_threshold,
         clip_k=args.clip_k,
+        wash_lookback_ms=int(args.wash_lookback_seconds * 1000),
+        wash_volume_ratio=args.wash_volume_ratio,
+        wash_price_range=args.wash_price_range,
+        wash_min_prior=args.wash_min_prior,
     )
     return (
         parsed.groupBy("ticker").applyInPandasWithState(
@@ -231,39 +284,6 @@ def build_baseline_stream(parsed, args):
             outputMode="update",
             timeoutConf=GroupStateTimeout.NoTimeout,
         )
-    )
-
-
-def build_wash_trade_stream(parsed, args):
-    windowed = (
-        parsed.withWatermark("event_time", args.wash_watermark)
-        .groupBy(F.col("ticker"), F.window(F.col("event_time"), args.wash_window))
-        .agg(
-            F.sum("volume").alias("total_volume"),
-            F.max("price").alias("max_price"),
-            F.min("price").alias("min_price"),
-            F.avg("price").alias("avg_price"),
-            F.count(F.lit(1)).alias("event_count"),
-        )
-        .withColumn(
-            "price_range_pct",
-            (F.col("max_price") - F.col("min_price")) / F.col("avg_price"),
-        )
-        .filter(
-            (F.col("total_volume") >= F.lit(args.wash_volume_threshold))
-            & (F.col("price_range_pct") <= F.lit(args.wash_price_stability))
-            & (F.col("event_count") >= F.lit(args.wash_min_events))
-        )
-    )
-    return windowed.select(
-        F.col("ticker"),
-        F.col("window.end").alias("timestamp"),
-        F.col("avg_price").alias("price"),
-        F.col("total_volume").alias("volume"),
-        F.lit(None).cast("double").alias("zscore"),
-        F.lit(None).cast("double").alias("vwap_divergence"),
-        F.lit(True).alias("is_anomaly"),
-        F.lit("wash_trade").alias("anomaly_type"),
     )
 
 
@@ -288,11 +308,7 @@ def read_parsed_ticks(spark, args):
 def build_sink(anomaly_df, args, name):
     """Wraps an {ticker, timestamp, price, volume, zscore, vwap_divergence,
     is_anomaly, anomaly_type}-shaped stream in a console or Kafka sink. `name`
-    scopes the checkpoint directory -- the baseline and wash-trade detectors
-    run as two independent streaming queries (Spark rejects
-    applyInPandasWithState in update mode if the *same* query plan also
-    contains a streaming aggregation, even in a unioned sibling branch), so
-    each needs its own checkpoint.
+    scopes the checkpoint directory under --checkpoint-dir.
     """
     checkpoint_dir = f"{args.checkpoint_dir.rstrip('/')}/{name}"
     if args.output_topic:
@@ -328,9 +344,8 @@ def build_sink(anomaly_df, args, name):
 
 def build_queries(spark, args):
     parsed = read_parsed_ticks(spark, args)
-    baseline_sink = build_sink(build_baseline_stream(parsed, args), args, "baseline")
-    wash_trade_sink = build_sink(build_wash_trade_stream(parsed, args), args, "wash_trade")
-    return [baseline_sink, wash_trade_sink]
+    # one query: both detectors live in the same stateful function
+    return [build_sink(build_baseline_stream(parsed, args), args, "baseline")]
 
 
 def parse_args():
@@ -354,13 +369,16 @@ def parse_args():
     ap.add_argument(
         "--baseline-window",
         type=int,
-        default=100,
-        help="Trailing tick count per ticker used for rolling mean/std/VWAP",
+        default=20,
+        help="Trailing tick count per ticker used for rolling mean/std/VWAP. Short on "
+        "purpose: a sweep (see README.md) found 15-25 ticks -- roughly the 2-minute "
+        "span that worked on the Frank-stream-processing branch -- beats 100 ticks on "
+        "both precision and recall, since a local baseline reacts to the current regime",
     )
     ap.add_argument(
         "--min-samples",
         type=int,
-        default=30,
+        default=10,
         help="Minimum trailing ticks before a baseline is trusted enough to score against",
     )
     ap.add_argument(
@@ -377,15 +395,13 @@ def parse_args():
     ap.add_argument(
         "--zscore-threshold",
         type=float,
-        default=3.5,
-        help="Z-score is the informative signal here. A full sweep (1.5-6.0, see "
-        "calibrate_thresholds.py and stream-processing/README.md) found F1 peaks at "
-        "z=4.0 (precision 5.5%%/recall 8.6%%), but this defaults to 3.5 instead -- "
-        "close to the peak on F1 (precision 4.2%%/recall 11.2%%) but recall-favoring, "
-        "since false negatives are worse than false positives for a surveillance use "
-        "case. Both precision (~4-5%%) and recall (~8-11%%) are near their ceiling "
-        "across the whole sweep -- this is the plain Z-score/VWAP baseline's real "
-        "detection limit on this data, not an undertuned threshold.",
+        default=5.0,
+        help="Z-score is the informative signal here. A sweep (3.0-7.0 at "
+        "--baseline-window 20, see calibrate_thresholds.py and README.md) found F1 "
+        "peaks at z=5.5 (precision 19.7%%/recall 35.5%%); this defaults to 5.0 -- "
+        "F1 within 0.001 of the peak (precision 18.7%%/recall 39.4%%) but "
+        "recall-favoring, since false negatives are worse than false positives for "
+        "a surveillance use case.",
     )
     ap.add_argument(
         "--vwap-threshold",
@@ -399,33 +415,33 @@ def parse_args():
         "it's kept as a secondary OR condition alongside Z-score, not the primary one.",
     )
 
-    # wash-trade windowed heuristic
-    ap.add_argument("--wash-window", default="30 seconds")
+    # wash-trade heuristic (runs inside the same per-ticker state function)
     ap.add_argument(
-        "--wash-watermark",
-        default="1 minute",
-        help="How late a tick may arrive before its window is closed",
-    )
-    ap.add_argument(
-        "--wash-volume-threshold",
+        "--wash-lookback-seconds",
         type=float,
-        default=20000.0,
-        help="Minimum total window volume to consider (median wash_trade volume "
-        "in the labeled dataset is ~44.6k vs ~4.6k for normal ticks -- tune "
-        "against the labeled data per stream-processing/README.md)",
+        default=120.0,
+        help="Trailing time span of prior ticks the wash-trade check compares against",
     )
     ap.add_argument(
-        "--wash-price-stability",
+        "--wash-volume-ratio",
         type=float,
-        default=0.0005,
-        help="Max (max_price - min_price) / avg_price within the window (default 0.05%%)",
+        default=0.3,
+        help="Flag a tick whose volume exceeds this fraction of the trailing lookback's "
+        "total volume (while the price range stays under --wash-price-range)",
     )
     ap.add_argument(
-        "--wash-min-events",
+        "--wash-price-range",
+        type=float,
+        default=0.001,
+        help="Max (max_price - min_price) / min_price across the trailing lookback for "
+        "the market to count as flat (default 0.1%%)",
+    )
+    ap.add_argument(
+        "--wash-min-prior",
         type=int,
-        default=5,
-        help="Minimum ticks in the window before the volume/stability check applies, "
-        "so a quiet window can't trivially satisfy the near-zero-movement check",
+        default=4,
+        help="Minimum prior ticks in the lookback before the wash-trade check applies, "
+        "so the first few ticks after a quiet gap can't trivially exceed the volume ratio",
     )
 
     ap.add_argument(

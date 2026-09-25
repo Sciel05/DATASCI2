@@ -17,8 +17,8 @@ from detect_anomalies import make_baseline_update_fn
 
 
 def state_tuple(state):
-    """Unpickle the (window, sum_price, sum_sq, sum_pv, sum_v) tuple out of
-    the state blob -- see the BASELINE_STATE_SCHEMA comment in
+    """Unpickle the (window, sum_price, sum_sq, sum_pv, sum_v, wash_hist)
+    tuple out of the state blob -- see the BASELINE_STATE_SCHEMA comment in
     detect_anomalies.py for why it's a pickled blob rather than plain fields.
     `window` is a list of (raw_price, clipped_price, volume) triples: raw
     feeds VWAP's accumulators, clipped feeds the mean/variance accumulators
@@ -28,7 +28,7 @@ def state_tuple(state):
 
 
 def std_from_state(state):
-    window, sum_price, sum_sq, _sum_pv, _sum_v = state_tuple(state)
+    window, sum_price, sum_sq, _sum_pv, _sum_v, _wash_hist = state_tuple(state)
     n = len(window)
     mean = sum_price / n
     variance = max(sum_sq / n - mean * mean, 0.0)
@@ -179,7 +179,7 @@ def test_window_evicts_oldest_and_sums_stay_consistent():
     out, state = run(fn, pdf)
     assert out["is_anomaly"].eq(False).all(), "small steady drift should not trip either threshold"
 
-    window, sum_price, sum_sq, sum_pv, sum_v = state_tuple(state)
+    window, sum_price, sum_sq, sum_pv, sum_v, _wash_hist = state_tuple(state)
     raw_prices = [w[0] for w in window]
     clipped_prices = [w[1] for w in window]
     assert len(window) == 5
@@ -201,6 +201,70 @@ def test_state_round_trips_across_batches():
     assert not out2.empty
     window, *_ = state_tuple(state)
     assert len(window) == 16
+
+
+def test_wash_trade_flagged_for_large_print_into_flat_market():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    # flat price, modest volume, then one outsized print at the same price
+    specs = [(100.0, 100.0)] * 15 + [(100.0, 5000.0)]
+    out, _ = run(fn, make_ticks(specs))
+    wash_row = out.iloc[-1]
+    assert wash_row["is_anomaly"]
+    assert wash_row["anomaly_type"] == "wash_trade"
+    assert not out.iloc[:-1]["is_anomaly"].any()
+
+
+def test_wash_trade_not_flagged_when_market_is_moving():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    # trailing prices span ~1% -- well over the 0.1% flatness limit
+    specs = [(100.0 + (0.5 if i % 2 == 0 else -0.5), 100.0) for i in range(15)]
+    specs.append((100.0, 5000.0))
+    out, _ = run(fn, make_ticks(specs))
+    assert out.iloc[-1]["anomaly_type"] != "wash_trade"
+
+
+def test_wash_trade_lookback_ignores_ticks_older_than_window():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01, wash_lookback_ms=10_000
+    )
+    # a big-volume history that ages out of the 10s lookback, then small flat
+    # ticks: the final print is only large relative to what's still in range
+    old = make_ticks([(100.0, 100_000.0)] * 5, start_ms=1_700_000_000_000)
+    recent = make_ticks([(100.0, 100.0)] * 5 + [(100.0, 1000.0)], start_ms=1_700_000_060_000)
+    out, _ = run(fn, pd.concat([old, recent], ignore_index=True))
+    assert out.iloc[-1]["anomaly_type"] == "wash_trade"
+
+
+def test_price_shock_takes_precedence_over_wash_trade():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=3.0, vwap_threshold=0.01)
+    specs = [(100.0 + (0.01 if i % 2 == 0 else -0.01), 100.0) for i in range(15)]
+    specs.append((150.0, 5000.0))  # both a huge move and an outsized print
+    out, _ = run(fn, make_ticks(specs))
+    assert out.iloc[-1]["anomaly_type"] == "price_shock"
+
+
+def test_wash_history_round_trips_across_batches():
+    """The trailing wash-trade lookback must survive a micro-batch boundary --
+    the reason this heuristic lives in the stateful function rather than a
+    per-batch window."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    first = make_ticks([(100.0, 100.0)] * 15, start_ms=1_700_000_000_000)
+    _, state = run(fn, first)
+    second = make_ticks([(100.0, 5000.0)], start_ms=1_700_000_015_000)
+    out2, _ = run(fn, second, state=state)
+    assert out2.iloc[0]["anomaly_type"] == "wash_trade"
+
+
+def test_resumes_from_pre_wash_trade_state_blob():
+    """State checkpointed before the wash-trade detector moved into this
+    function holds a 5-tuple; it must still load."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    state = FakeState()
+    old_window = [(100.0, 100.0, 100.0)] * 12
+    state.update((pickle.dumps((old_window, 1200.0, 120000.0, 120000.0, 1200.0)),))
+    out, state = run(fn, make_ticks([(100.0, 100.0)]), state=state)
+    assert out.iloc[0]["zscore"] is not None
+    assert len(state_tuple(state)) == 6
 
 
 if __name__ == "__main__":
