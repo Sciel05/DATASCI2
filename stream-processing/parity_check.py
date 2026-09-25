@@ -18,7 +18,7 @@ Run inside the pyspark container (repo mounted at /workspace):
 data-ingestion/producer.py, runs detect_anomalies.py with small
 micro-batches (--max-offsets-per-trigger) so per-ticker state has to carry
 across batch boundaries, reads the output topic back, compares, and always
-deletes the topics it created. Detector flags after `--` are passed to both
+deletes the topics (and the consumer group) it created. Detector flags after `--` are passed to both
 the Spark job and the offline run.
 
 `slice` and `compare` do the first and last step alone, for a pipeline run
@@ -215,7 +215,7 @@ def create_topics(admin, specs):
 
     futures = admin.create_topics([NewTopic(name, num_partitions=p, replication_factor=1) for name, p in specs])
     for name, f in futures.items():
-        f.result()
+        f.result(timeout=30)
         print(f"created topic {name}")
 
 
@@ -223,21 +223,22 @@ def delete_topics(admin, names):
     futures = admin.delete_topics(list(names), operation_timeout=30)
     for name, f in futures.items():
         try:
-            f.result()
+            f.result(timeout=30)
             print(f"deleted topic {name}")
         except Exception as e:  # keep deleting the rest; report what failed
             print(f"WARNING: could not delete topic {name}: {e}", file=sys.stderr)
 
 
-def consume_all(bootstrap, topic, idle_timeout_s=15.0):
+def consume_all(admin, bootstrap, topic, idle_timeout_s=15.0):
     """Reads every message on `topic` (one partition), stopping at the end
     of the partition or after `idle_timeout_s` without messages."""
     from confluent_kafka import Consumer, KafkaError
 
+    group = f"parity-{uuid.uuid4().hex}"
     c = Consumer(
         {
             "bootstrap.servers": bootstrap,
-            "group.id": f"parity-{uuid.uuid4().hex}",
+            "group.id": group,
             "auto.offset.reset": "earliest",
             "enable.partition.eof": True,
             "enable.auto.commit": False,
@@ -258,7 +259,25 @@ def consume_all(bootstrap, topic, idle_timeout_s=15.0):
             last = time.time()
     finally:
         c.close()
+        delete_group(admin, group)
     return lines
+
+
+def delete_group(admin, group, attempts=5):
+    """The group has no committed offsets, but the broker still lists it.
+    Right after the consumer closes it can briefly still count as active,
+    so retry. `admin` must be a client the caller keeps alive -- a
+    confluent-kafka future never resolves if its client is garbage
+    collected, which is why this doesn't create its own."""
+    for attempt in range(attempts):
+        try:
+            admin.delete_consumer_groups([group], request_timeout=10)[group].result(timeout=15)
+            print(f"deleted consumer group {group}")
+            return
+        except Exception as e:
+            if attempt == attempts - 1:
+                print(f"WARNING: could not delete consumer group {group}: {e}", file=sys.stderr)
+            time.sleep(2)
 
 
 def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size):
@@ -298,7 +317,7 @@ def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size):
         n_batches = len([p for p in commits.iterdir() if p.name.isdigit()]) if commits.exists() else 0
         print(f"spark job committed {n_batches} micro-batches (<= {batch_size} records each)")
 
-        lines = consume_all(bootstrap, out_topic)
+        lines = consume_all(admin, bootstrap, out_topic)
         spark_output_path(days).write_text("\n".join(lines) + "\n", encoding="utf-8")
     finally:
         delete_topics(admin, [in_topic, out_topic])
