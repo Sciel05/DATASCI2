@@ -24,11 +24,9 @@ from detect_anomalies import (
 
 
 def std_from_state(state):
-    st = load_state(state)
-    n = len(st["window"])
-    mean = st["sum_price"] / n
-    variance = max(st["sum_sq"] / n - mean * mean, 0.0)
-    return variance**0.5
+    clipped = [c for _raw, c, _vol in load_state(state)["window"]]
+    mean = sum(clipped) / len(clipped)
+    return (sum((c - mean) ** 2 for c in clipped) / len(clipped)) ** 0.5
 
 
 class FakeState:
@@ -163,7 +161,7 @@ def test_bounded_influence_limits_baseline_widening_after_shock():
     )
 
 
-def test_window_evicts_oldest_and_sums_stay_consistent():
+def test_window_evicts_oldest_and_vwap_sums_stay_consistent():
     # Small, steady drift (0.001/tick) so neither the Z-score nor VWAP-divergence
     # threshold trips -- a *monotonic* drift on the order of the price itself
     # (e.g. +1 on a ~100 base) diverges from the windowed VWAP fast enough to
@@ -180,8 +178,10 @@ def test_window_evicts_oldest_and_sums_stay_consistent():
     clipped_prices = [w[1] for w in st["window"]]
     assert len(st["window"]) == 5
     assert raw_prices == prices_in[-5:]
-    assert abs(st["sum_price"] - sum(clipped_prices)) < 1e-6
-    assert abs(st["sum_sq"] - sum(p * p for p in clipped_prices)) < 1e-6
+    assert clipped_prices == raw_prices  # no shock, so nothing was clipped
+    assert "sum_price" not in st and "sum_sq" not in st  # computed from the window now
+    assert abs(st["sum_pv"] - sum(p * 10.0 for p in raw_prices)) < 1e-6
+    assert abs(st["sum_v"] - 50.0) < 1e-9
 
 
 def test_state_round_trips_across_batches():
@@ -621,6 +621,21 @@ def test_volume_spike_fires_on_a_large_print_after_warmup_even_if_price_moves():
     assert last["signals"] == "volume_spike"
     out, _ = run(fn, make_ticks(calm + [(100.5, 300.0)]))  # ~3x typical: under the 6x limit
     assert not out.iloc[-1]["is_anomaly"]
+
+
+def test_zscore_is_insensitive_to_one_ulp_input_differences():
+    """The running-sum variance (sum_sq/n - mean^2) turned one-ulp changes in
+    input prices (a CSV write + re-read does this) into z-score differences
+    of ~1.5e-5 on this series; computed from the window directly they stay
+    around 1e-11."""
+    rng = np.random.default_rng(3)
+    prices = list(213.87 + np.cumsum(rng.normal(0, 0.005, 400)))
+    nudged = [np.nextafter(p, np.inf) if i % 7 == 0 else p for i, p in enumerate(prices)]
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    a, _ = run(fn, make_ticks([(p, 100.0) for p in prices]))
+    b, _ = run(fn, make_ticks([(p, 100.0) for p in nudged]))
+    za, zb = a["zscore"].astype(float).to_numpy()[100:], b["zscore"].astype(float).to_numpy()[100:]
+    assert np.nanmax(np.abs(za - zb)) < 1e-9
 
 
 def test_checkpoint_path_includes_state_layout_version():

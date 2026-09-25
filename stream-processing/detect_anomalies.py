@@ -205,8 +205,6 @@ def empty_state():
     ticks."""
     return {
         "window": [],
-        "sum_price": 0.0,
-        "sum_sq": 0.0,
         "sum_pv": 0.0,
         "sum_v": 0.0,
         "wash_hist": [],
@@ -306,7 +304,7 @@ def make_baseline_update_fn(
     def update_baseline(key, pdf_iter, state: GroupState):
         st = load_state(state)
         window, wash_hist = st["window"], st["wash_hist"]
-        sum_price, sum_sq, sum_pv, sum_v = st["sum_price"], st["sum_sq"], st["sum_pv"], st["sum_v"]
+        sum_pv, sum_v = st["sum_pv"], st["sum_v"]
         last_ts, late_dropped = st["last_ts"], st["late_dropped"]
         ewma_fast, ewma_slow = st["ewma_fast"], st["ewma_slow"]
         ewma_div_ms, ewma_n = st["ewma_div_ms"], st["ewma_n"]
@@ -335,7 +333,7 @@ def make_baseline_update_fn(
                     # close is no baseline for this morning's open, so both
                     # detectors start cold and re-warm.
                     window, wash_hist = [], []
-                    sum_price = sum_sq = sum_pv = sum_v = 0.0
+                    sum_pv = sum_v = 0.0
                     ewma_fast = ewma_slow = None
                     ewma_div_ms, ewma_n = 0.0, 0
                     cusum_up = cusum_down = cusum_vol = 0.0
@@ -435,8 +433,14 @@ def make_baseline_update_fn(
 
                 n = len(window)
                 if n >= min_samples:
-                    mean = sum_price / n
-                    variance = max(sum_sq / n - mean * mean, 0.0)
+                    # Mean and variance straight from the (at most
+                    # window_size) clipped prices, two-pass. The running-sum
+                    # form sum_sq/n - mean^2 cancels badly at price levels of
+                    # 100-500 with tick-level spreads: a one-ulp input change
+                    # moved later z-scores by ~1e-6.
+                    clipped = [c for _raw, c, _vol in window]
+                    mean = sum(clipped) / n
+                    variance = sum((c - mean) * (c - mean) for c in clipped) / n
                     std = variance**0.5
                     zscore = (row.price - mean) / std if std > 1e-9 else 0.0
                     vwap = sum_pv / sum_v if sum_v > 1e-9 else None
@@ -556,18 +560,14 @@ def make_baseline_update_fn(
                 # Roll the window forward AFTER scoring this tick, so every
                 # price is tested against the baseline of ticks strictly
                 # before it -- an anomalous tick never pollutes its own
-                # baseline. The clipped price (not the raw price) feeds the
-                # mean/variance accumulators; VWAP's accumulators still use
-                # the raw price/volume.
+                # baseline. The clipped price (not the raw price) is what the
+                # mean/variance are computed from; VWAP's accumulators still
+                # use the raw price/volume.
                 window.append((row.price, clipped_price, row.volume))
-                sum_price += clipped_price
-                sum_sq += clipped_price * clipped_price
                 sum_pv += row.price * row.volume
                 sum_v += row.volume
                 if len(window) > window_size:
-                    old_raw, old_clipped, old_vol = window.pop(0)
-                    sum_price -= old_clipped
-                    sum_sq -= old_clipped * old_clipped
+                    old_raw, _old_clipped, old_vol = window.pop(0)
                     sum_pv -= old_raw * old_vol
                     sum_v -= old_vol
 
@@ -584,8 +584,6 @@ def make_baseline_update_fn(
                 pickle.dumps(
                     {
                         "window": window,
-                        "sum_price": sum_price,
-                        "sum_sq": sum_sq,
                         "sum_pv": sum_pv,
                         "sum_v": sum_v,
                         "wash_hist": wash_hist,
