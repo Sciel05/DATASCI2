@@ -15,7 +15,7 @@ import pandas as pd
 import pytest
 
 from detect_anomalies import (
-    CUSUM_STATE_FIELDS,
+    TYPED_STATE_NAMES,
     STATE_LAYOUT_VERSION,
     checkpoint_path,
     load_state,
@@ -267,8 +267,8 @@ def test_resumes_from_legacy_tuple_state_blob(n_fields):
     assert isinstance(saved, dict)
     assert len(saved["window"]) == 13
     assert saved["late_dropped"] == 0
-    assert len(typed) == len(CUSUM_STATE_FIELDS)
-    assert typed[-1] == 1  # cusum_n: the legacy state had no CUSUM history
+    assert len(typed) == len(TYPED_STATE_NAMES)
+    assert dict(zip(TYPED_STATE_NAMES, typed))["cusum_n"] == 1  # the legacy state had no CUSUM history
 
 
 # --- overnight gap reset
@@ -391,13 +391,22 @@ def noisy(base, n, step=0.01, seed=0):
     return [base + (step if i % 2 == 0 else -step) + rng.normal(0, step / 4) for i in range(n)]
 
 
-def test_cusum_state_is_typed_fields_not_pickle():
+def test_scalar_state_is_typed_fields_not_pickle():
+    """CUSUM, trading-rate, incident and tick_id state are typed Spark
+    fields; none of them is also pickled into the blob."""
     fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
-    _, state = run(fn, make_ticks([(p, 100.0) for p in noisy(100.0, 30)]))
+    specs = [(p, 100.0) for p in noisy(100.0, 30)] + [(150.0, 100.0)]  # a shock opens an incident
+    _, state = run(fn, make_ticks(specs))
     blob, *typed = state.get
-    assert len(typed) == len(CUSUM_STATE_FIELDS)
-    assert typed[-1] == 30  # cusum_n
-    assert not any(k.startswith("cusum_") for k in pickle.loads(blob))
+    assert len(typed) == len(TYPED_STATE_NAMES)
+    typed = dict(zip(TYPED_STATE_NAMES, typed))
+    assert typed["cusum_n"] == 31
+    assert typed["rate_n"] == 30
+    assert typed["rate_dt_ms"] == 1000.0
+    assert typed["incident_id"] is not None and typed["incident_id"].startswith("AAPL-")
+    assert typed["ticks_since_flag"] == 0
+    assert typed["same_ts_seq"] == 0
+    assert not set(TYPED_STATE_NAMES) & set(pickle.loads(blob))
 
 
 def test_price_cusum_flags_a_steady_ramp_after_warmup():

@@ -163,10 +163,12 @@ OUTPUT_COLUMNS = [f.name for f in OUTPUT_SCHEMA.fields]
 # v3: typical time between ticks (rate_dt_ms, rate_n) in the blob.
 # v4: open incident (incident_id, ticks_since_flag) in the blob.
 # v5: same_ts_seq (tick_id sequence within a millisecond) in the blob.
-STATE_LAYOUT_VERSION = 5
+# v6: trading rate, open incident and same_ts_seq move to typed fields.
+STATE_LAYOUT_VERSION = 6
 #
-# CUSUM state is kept as plain typed fields next to the blob (scalars only,
-# so the ArrayType problem above doesn't apply).
+# Scalar state is kept as plain typed fields next to the blob (scalars only,
+# so the ArrayType problem above doesn't apply); the blob holds the lists
+# (window, wash_hist) and the remaining baseline/EWMA scalars.
 CUSUM_STATE_FIELDS = [
     ("cusum_up", DoubleType()),  # price CUSUM, upward
     ("cusum_down", DoubleType()),  # price CUSUM, downward
@@ -177,8 +179,16 @@ CUSUM_STATE_FIELDS = [
     ("cusum_logv_var", DoubleType()),  # slow EW variance of log volume
     ("cusum_n", LongType()),  # ticks since the last reset
 ]
+TYPED_STATE_FIELDS = CUSUM_STATE_FIELDS + [
+    ("rate_dt_ms", DoubleType()),  # typical time between ticks (slow EWMA, ms)
+    ("rate_n", LongType()),  # gaps averaged since the last reset
+    ("incident_id", StringType()),  # open incident, or null
+    ("ticks_since_flag", LongType()),  # unflagged ticks since the open incident's last flag
+    ("same_ts_seq", LongType()),  # ticks already seen at last_ts, for tick_id
+]
+TYPED_STATE_NAMES = [name for name, _t in TYPED_STATE_FIELDS]
 BASELINE_STATE_SCHEMA = StructType(
-    [StructField("blob", BinaryType())] + [StructField(name, t, True) for name, t in CUSUM_STATE_FIELDS]
+    [StructField("blob", BinaryType())] + [StructField(name, t, True) for name, t in TYPED_STATE_FIELDS]
 )
 
 # Earlier versions of this job pickled a positional tuple; these were its
@@ -234,9 +244,11 @@ def empty_cusum_state():
 
 
 def load_state(state):
-    """State as one dict: the unpickled blob plus the typed CUSUM fields.
-    Fills fields that older layouts didn't have (a one-field state holding
-    a pickled tuple or dict, before the typed fields existed)."""
+    """State as one dict: the unpickled blob plus the typed fields. Fills
+    fields that older layouts didn't have (a one-field state holding a
+    pickled tuple or dict, before the typed fields existed; or fewer typed
+    fields). A typed field left null keeps the default (or an older blob's
+    value), except incident_id, whose null means "no open incident"."""
     st = empty_state()
     if state.exists:
         blob, *typed = state.get
@@ -245,8 +257,8 @@ def load_state(state):
             st.update(saved)
         else:
             st.update(zip(_LEGACY_STATE_FIELDS, saved))
-        for (name, _t), value in zip(CUSUM_STATE_FIELDS, typed):
-            if value is not None:
+        for name, value in zip(TYPED_STATE_NAMES, typed):
+            if value is not None or name == "incident_id":
                 st[name] = value
     return st
 
@@ -583,11 +595,6 @@ def make_baseline_update_fn(
                         "ewma_slow": ewma_slow,
                         "ewma_div_ms": ewma_div_ms,
                         "ewma_n": ewma_n,
-                        "rate_dt_ms": rate_dt_ms,
-                        "rate_n": rate_n,
-                        "incident_id": incident_id,
-                        "ticks_since_flag": ticks_since_flag,
-                        "same_ts_seq": same_ts_seq,
                     }
                 ),
                 float(cusum_up),
@@ -598,6 +605,11 @@ def make_baseline_update_fn(
                 float(cusum_logv_mean),
                 float(cusum_logv_var),
                 int(cusum_n),
+                float(rate_dt_ms),
+                int(rate_n),
+                incident_id,
+                int(ticks_since_flag),
+                int(same_ts_seq),
             )
         )
 
