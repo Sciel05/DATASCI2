@@ -372,8 +372,12 @@ def read_parsed_ticks(spark, args):
         .option("subscribe", args.input_topic)
         .option("startingOffsets", args.starting_offsets)
         .option("failOnDataLoss", "false")
-        .load()
     )
+    if args.max_offsets_per_trigger:
+        # small micro-batches force per-ticker state across many batch
+        # boundaries -- used by parity_check.py
+        raw = raw.option("maxOffsetsPerTrigger", args.max_offsets_per_trigger)
+    raw = raw.load()
 
     return (
         raw.select(F.from_json(F.col("value").cast("string"), TICK_SCHEMA).alias("tick"))
@@ -426,7 +430,7 @@ def build_queries(spark, args):
     return [build_sink(build_baseline_stream(parsed, args), args, "baseline")]
 
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap-servers", default="localhost:9092")
     ap.add_argument("--input-topic", default="market-ticks")
@@ -442,6 +446,12 @@ def parse_args():
         help="Use 'earliest' to replay the full labeled dataset for evaluation",
     )
     ap.add_argument("--checkpoint-dir", default="./checkpoints/detect_anomalies")
+    ap.add_argument(
+        "--max-offsets-per-trigger",
+        type=int,
+        default=None,
+        help="Cap Kafka records per micro-batch (default: no cap)",
+    )
 
     # statistical baseline (flatMapGroupsWithState / applyInPandasWithState)
     ap.add_argument(
@@ -545,7 +555,7 @@ def parse_args():
         action="store_true",
         help="Process available data once and stop (useful for evaluation batch runs)",
     )
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 def main():
