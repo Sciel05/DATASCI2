@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from detect_anomalies import make_baseline_update_fn
+from detect_anomalies import detector_kwargs, make_baseline_update_fn, parse_args
 
 # resolved relative to this file, so it works natively and inside the Docker
 # container (where the repo is mounted at /workspace)
@@ -86,14 +86,23 @@ def load_data():
     return df
 
 
-def run_detector(df, z_threshold, vwap_threshold):
-    fn = make_baseline_update_fn(
-        window_size=WINDOW_SIZE,
-        min_samples=MIN_SAMPLES,
-        z_threshold=z_threshold,
-        vwap_threshold=vwap_threshold,
-        clip_k=CLIP_K,
-    )
+def run_detector(df, z_threshold, vwap_threshold, full_detector=False):
+    """The sweeps isolate the Z-score/VWAP price signal (the EWMA ramp and
+    CUSUM signals are switched off). full_detector=True runs every signal
+    at the Spark job's defaults instead."""
+    kwargs = detector_kwargs(parse_args([]))
+    if not full_detector:
+        kwargs.update(
+            window_size=WINDOW_SIZE,
+            min_samples=MIN_SAMPLES,
+            z_threshold=z_threshold,
+            vwap_threshold=vwap_threshold,
+            clip_k=CLIP_K,
+            ewma_threshold=float("inf"),
+            cusum_h=float("inf"),
+            cusum_volume_h=float("inf"),
+        )
+    fn = make_baseline_update_fn(**kwargs)
     results = []
     for ticker, g in df.groupby("ticker"):
         g = g.sort_values("event_time_ms")
@@ -172,9 +181,8 @@ def main():
           f"(F1={best_v_score['f1']:.4f}, precision={best_v_score['precision']:.2%}, "
           f"recall={best_v_score['recall']:.2%})\n")
 
-    full = run_detector(df, PRODUCTION_Z_THRESHOLD, DEFAULT_VWAP_THRESHOLD)
-    print(f"=== Production defaults (z={PRODUCTION_Z_THRESHOLD}, vwap={DEFAULT_VWAP_THRESHOLD}): "
-          f"every detector ===\n")
+    full = run_detector(df, PRODUCTION_Z_THRESHOLD, DEFAULT_VWAP_THRESHOLD, full_detector=True)
+    print("=== Spark job defaults, every signal (EWMA, CUSUMs, risk score included; tick-level) ===\n")
     print_table(
         [
             ("price_shock", score(full)),
