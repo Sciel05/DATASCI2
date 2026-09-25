@@ -3,12 +3,13 @@
 **Status: implemented (`detect_anomalies.py`), unit-tested, evaluated
 out-of-sample and on a held-out set of harder anomalies never used for
 tuning, and verified tick-for-tick against the real Kafka + Spark
-pipeline (see Parity check). On the held-out harder variants the final
-detector roughly doubles F1 over the pre-change detector (slow ramps
-0.153 -> 0.300; finely split wash trades 0.089 -> 0.241) and beats the
-naive threshold baseline. It is not better everywhere: see "Final
-results" for the regressions, including that a plain volume threshold
-still beats it on the original wash trades.**
+pipeline (see Parity check). On the time-split test period it beats the
+naive threshold baseline on every anomaly type (per-event F1: price
+shocks 0.404 vs 0.286, wash trades 0.966 vs 0.871, held-out slow ramps
+0.334 vs 0.057, held-out fine splits 0.412 vs 0.087), with ~72% of
+incidents overlapping a real anomaly at ~7 alerts per ticker-hour.
+Remaining regressions and limits are listed under "Final results" and
+"Known limitations" — slow price ramps in particular stay hard.**
 
 Owns: real-time detection logic in Apache Spark Structured Streaming.
 Consumes from the `market-ticks` Kafka topic that `data-ingestion/`
@@ -58,38 +59,49 @@ Price signals (flag `anomaly_type = "price_shock"`):
 - **Z-score / VWAP**: rolling Z-score over the last `--baseline-window`
   ticks (default 20, scored once `--min-samples` 10 are available), and
   VWAP divergence. A tick is scored against the window *before* it, and
-  its contribution to the running mean/variance is clipped to `--clip-k`
-  (5) standard deviations (see Calibration notes).
+  its contribution to the window is clipped to `--clip-k` (5) standard
+  deviations (see Calibration notes). Mean and variance are computed
+  directly from the (at most 20) clipped prices in the window.
 - **EWMA ramp signal**: a fast price EWMA (span 3) against a slow one
   (span 20), divided by the RMS of their recent divergence. A price
   walked up or down over many ticks pulls the two apart before any single
   tick looks extreme. Scored after 50 ticks.
 - **Price CUSUM**: two-sided CUSUM of tick-to-tick price changes,
   standardized by a slow RMS of (clipped) changes; allowance k=2, alarm
-  h=6. Scored after 50 ticks.
+  h=6. Scored after 50 ticks. The side that fires restarts at zero.
 
 Volume signals (flag `anomaly_type = "wash_trade"`):
 
 - **Wash rule** (adapted from the `Frank-stream-processing` branch): a
-  tick whose volume exceeds `--wash-volume-ratio` (30%) of the trailing
+  tick whose volume exceeds `--wash-volume-ratio` (70%) of the trailing
   lookback's volume while that lookback's price range stays under
-  `--wash-price-range` (0.1%), given at least `--wash-min-prior` (4)
-  prior ticks. The lookback is `--wash-lookback-ticks` (16) ticks' worth
+  `--wash-price-range` (0.15%), given at least `--wash-min-prior` (4)
+  prior ticks. At these re-tuned defaults it rarely fires on its own —
+  the volume spike and volume CUSUM now cover what it caught (see Final
+  results) — but the price range also gates the volume CUSUM. The lookback is `--wash-lookback-ticks` (16) ticks' worth
   of the ticker's typical time between ticks (a slow average of
   inter-tick gaps, each capped at 60s), so busy and quiet tickers look
   back over a comparable number of trades; the fixed
   `--wash-lookback-seconds` (120) applies until that average has 20 ticks.
 - **Volume CUSUM**: one-sided CUSUM of standardized log-volume above its
   slow average, accumulated only while the lookback's price range is
-  flat and reset as soon as price moves; k=0.75, h=3. Catches many
-  modestly-large prints into a flat market (split wash trades).
+  flat and reset as soon as price moves; k=0.75, h=3; restarts at zero
+  after it fires. Catches many modestly-large prints into a flat market
+  (split wash trades).
+- **Volume spike**: the naive volume-threshold rule, scaled per ticker —
+  a tick whose volume exceeds `--volume-spike-multiple` (6) times the
+  ticker's typical (slow-average) volume, with no flat-market condition.
+  Catches the obvious large prints.
 
 Each CUSUM step is clipped to `--clip-k`, and the slow statistics update
-after scoring, so one shock can't carry a CUSUM alone.
+after scoring, so one shock can't carry a CUSUM alone. A CUSUM that
+fires restarts from zero on the next tick, so a burst raises one alarm
+per accumulation rather than one per tick.
 
 **Risk score and incidents.** Every signal is expressed as a multiple of
 its own alarm level (|z|/5, vwap_div/1%, |ewma_div|/2.75, CUSUM/h, tick
-volume / the wash rule's volume limit); `risk_score` is the largest. A
+volume / the wash rule's volume limit, tick volume / 6x typical volume);
+`risk_score` is the largest. A
 tick is flagged when `risk_score > --risk-threshold` (1.0, i.e. any
 signal past its own alarm level); `signals` lists which. `anomaly_type`
 is `price_shock` if any price signal fired, else `wash_trade`.
@@ -133,7 +145,8 @@ The eight original fields, unchanged, then the appended ones (full types
 in `docs/cassandra-schema-notes.md`): `ewma_divergence`, `cusum_price`,
 `cusum_volume`, `risk_score`, `signals`, `incident_id`, `tick_id`.
 `anomaly_type` still takes only `price_shock` / `wash_trade` / null —
-which signal fired is in `signals`.
+which signal fired is in `signals` (`zscore`, `vwap`, `ewma`,
+`cusum_price`, `wash_rule`, `cusum_volume`, `volume_spike`).
 
 ## Evaluating against ground truth
 
@@ -161,8 +174,8 @@ ticks and a `wash_trade` burst spans 4-9 ticks.
 - **Tick-level** (`calibrate_thresholds.py`, and sections 1-3 of
   `evaluate_generalization.py`): a flag is a true positive only on the
   labeled first tick. Flags on an event's later ticks count as false
-  positives, so this **understates precision** — badly for the CUSUMs,
-  which keep firing through a burst.
+  positives, so this **understates precision** — especially for signals
+  that fire more than once per event.
 - **Event-level** (section 4 of `evaluate_generalization.py`): an event
   is detected if the matching detector (by `anomaly_type`) flags *any*
   tick inside its span. Precision counts flags inside that type's spans
@@ -196,110 +209,140 @@ chosen while looking at it.
 
 ### Final results (per event)
 
-`python evaluate_generalization.py --heldout --naive`. Final detector vs
-the detector before the changes in this round (commit `cd3536c`: Z-score
-+ VWAP + fixed-lookback wash rule) and the naive fixed-threshold baseline
-(|tick return| for price shocks, raw volume for wash trades; thresholds
-tuned tick-level on the time-split training set):
+`python evaluate_generalization.py --heldout --naive [--period test]`.
 
-| type | pre-change P / R / F1 | **final P / R / F1** | naive P / R / F1 |
-|---|---|---|---|
-| price_shock (original) | 36.7% / 39.1% / 0.378 | **33.1% / 42.9% / 0.374** | 23.7% / 49.2% / 0.320 |
-| wash_trade (original) | 78.8% / 51.4% / 0.622 | **57.0% / 90.1% / 0.698** | 79.1% / 97.1% / **0.872** |
-| shock_ramp (existing) | 25.6% / 7.2% / 0.113 | **34.5% / 16.7% / 0.225** | 11.9% / 4.8% / 0.069 |
-| wash_split (existing) | 40.6% / 13.6% / 0.204 | **51.2% / 70.1% / 0.591** | 44.4% / 27.7% / 0.341 |
-| **shock_ramp_long (held-out)** | 31.0% / 10.2% / 0.153 | **39.1% / 24.3% / 0.300** | 19.7% / 5.3% / 0.084 |
-| **wash_split_fine (held-out)** | 22.2% / 5.5% / 0.089 | **18.1% / 36.1% / 0.241** | 23.2% / 6.6% / 0.102 |
+**How the settings were chosen.** The latest round (CUSUM restart,
+volume spike, wash-rule ratio/range) was tuned on the **training split
+only** — the first 70% of the timeline, on the original anomalies plus
+the existing variants. Earlier defaults (z, window, EWMA, CUSUM k/h,
+lookback, risk threshold) were chosen on all five days of the original
+data and existing variants. So the **test period** below is clean with
+respect to the latest round but not fully clean overall, and the
+**held-out variants** were never used for any choice.
 
-What changed, per step (per event, existing variants, tuned on the
-original data + existing variants only):
+**Test period** (Sep 18 16:58 UTC onward, 30% of the timeline):
 
-| step | price_shock | wash_trade | shock_ramp | wash_split |
+| type | final P / R / F1 | naive P / R / F1 |
+|---|---|---|
+| price_shock (original) | 35.2% / 47.5% / **0.404** | 21.3% / 43.6% / 0.286 |
+| wash_trade (original) | 93.5% / 100% / **0.966** | 78.9% / 97.1% / 0.871 |
+| shock_ramp (existing) | 36.5% / 20.2% / **0.260** | 10.1% / 3.0% / 0.046 |
+| wash_split (existing) | 89.4% / 77.5% / **0.830** | 40.4% / 30.2% / 0.346 |
+| **shock_ramp_long (held-out)** | 38.6% / 29.5% / **0.334** | 16.4% / 3.5% / 0.057 |
+| **wash_split_fine (held-out)** | 67.5% / 29.7% / **0.412** | 25.4% / 5.2% / 0.087 |
+
+**All days**, against the detector before this work (commit `cd3536c`:
+Z-score + VWAP + fixed-lookback wash rule) and the previous round
+(`d1f3b02`):
+
+| type | pre-change F1 | previous round F1 | **final P / R / F1** | naive F1 |
 |---|---|---|---|---|
-| before | 0.378 | 0.622 | 0.113 | 0.204 |
-| 3a EWMA ramp signal | 0.378 | 0.622 | 0.183 | 0.204 |
-| 3b price + volume CUSUM | 0.374 | 0.634 | 0.225 | 0.489 |
-| 3c lookback scaled to trading rate | 0.374 | 0.698 | 0.225 | 0.591 |
-| 3d risk score + incidents (threshold 1.0) | 0.374 | 0.698 | 0.225 | 0.591 |
+| price_shock (original) | 0.378 | 0.374 | 36.1% / 42.9% / **0.392** | 0.320 |
+| wash_trade (original) | 0.622 | 0.698 | 93.7% / 99.2% / **0.963** | 0.872 |
+| shock_ramp (existing) | 0.113 | 0.225 | 32.2% / 16.5% / **0.218** | 0.069 |
+| wash_split (existing) | 0.204 | 0.591 | 89.3% / 73.3% / **0.805** | 0.341 |
+| **shock_ramp_long (held-out)** | 0.153 | 0.300 | 36.3% / 24.1% / **0.290** | 0.084 |
+| **wash_split_fine (held-out)** | 0.089 | 0.241 | 66.6% / 29.9% / **0.413** | 0.102 |
 
-**Where the changes made results on the original anomalies worse:**
+The naive baseline flags |tick return| and raw volume above thresholds
+tuned tick-level on the training split.
 
-- **price_shock F1 0.378 -> 0.374** (precision 36.7% -> 33.1%): the
-  price CUSUM (3b) and the EWMA signal (3a) add flags on normal trending
-  periods. Accepted as a small regression.
-- **wash_trade precision 78.8% -> 57.0%** per event (F1 still rises,
-  0.622 -> 0.698, on recall 51.4% -> 90.1%).
-- **Flag volume and tick-level scores.** The volume CUSUM and longer
-  lookback keep flagging through a burst, so the full detector now flags
-  8,548 ticks (6.1%, was ~1.3%) and its in-sample tick-level F1 fell
-  (price_shock 0.287 -> 0.256, wash_trade 0.265 -> 0.101, any 0.281 ->
-  0.135; `calibrate_thresholds.py`). Per event and per incident it is
-  better; per row written to the output topic it is noisier.
-- **A plain volume threshold beats the detector on the original wash
-  trades** (0.872 vs 0.698 per event). Those are 6-15x volume spikes, and
-  a raw volume cut-off catches nearly all of them. The detector wins on
-  price shocks (0.374 vs 0.320) and on every harder variant, including
-  both held-out sets.
-- **Held-out `wash_split_fine` precision is lower than before** (22.2% ->
-  18.1%), though recall rises 5.5% -> 36.1% (F1 0.089 -> 0.241): 1.2-2x
-  prints are close to normal volume, so the volume CUSUM also fires on
-  ordinary busy flat stretches.
+**Latest round, step by step** (training split only; flagged ticks,
+incidents, alerts per ticker-hour and incident precision on the original
+data; per-event F1):
 
-**Incidents** (default risk threshold 1.0):
+| step | flagged ticks | incidents | alerts/h | incident precision | price_shock | wash_trade | shock_ramp | wash_split |
+|---|---|---|---|---|---|---|---|---|
+| before | 5.94% | 1,003 | 8.7 | 51.0% | 0.367 | 0.694 | 0.205 | 0.587 |
+| 1. CUSUMs restart after firing | 2.62% | 1,035 | 9.0 | 50.9% | 0.380 | 0.786 | 0.201 | 0.615 |
+| 2. volume spike signal (6x typical) | 3.42% | 1,084 | 9.4 | 51.7% | 0.380 | 0.871 | 0.201 | 0.690 |
+| 3. scalar state in typed fields | 3.42% | 1,084 | 9.4 | 51.7% | 0.380 | 0.871 | 0.201 | 0.690 |
+| 4. variance straight from the window | 3.40% | 1,085 | 9.4 | 51.6% | 0.386 | 0.871 | 0.200 | 0.690 |
+| 5. wash rule re-tuned (0.7 / 0.15%) | 2.92% | 765 | 6.7 | 71.9% | 0.386 | 0.962 | 0.200 | 0.794 |
 
-| dataset | incidents | incidents overlapping a real anomaly | events caught | alerts / ticker / hour | AAPL | GOOGL | MSFT | NVDA | TSLA |
-|---|---|---|---|---|---|---|---|---|---|
-| original | 1,431 | 52.1% | 68.9% | 8.8 | 7.5 | 5.9 | 5.0 | 17.1 | 8.5 |
-| + shock_ramp | 1,462 | 60.2% | 53.5% | 9.0 | 7.6 | 5.9 | 5.0 | 17.9 | 8.5 |
-| + wash_split | 2,012 | 59.2% | 69.5% | 12.4 | 11.4 | 7.8 | 7.0 | 23.5 | 12.2 |
-| + shock_ramp_long (held-out) | 1,505 | 65.0% | 58.1% | 9.3 | 7.7 | 6.1 | 5.3 | 18.2 | 9.0 |
-| + wash_split_fine (held-out) | 1,962 | 49.8% | 58.3% | 12.1 | 10.9 | 7.8 | 6.7 | 23.2 | 11.8 |
+Findings from the round:
 
-Each dataset is the original data plus that variant, so every row also
-contains the original anomalies. Alert rates scale with each ticker's
-trading activity (NVDA trades ~2-3x as often as the others).
+- **The CUSUM restart halved the flag volume** (5.94% -> 2.62% of
+  ticks) — the CUSUMs had kept firing through every burst — and raised
+  wash_trade F1 0.694 -> 0.786.
+- **The volume spike had to be relative to each ticker.** A fixed share
+  count (the naive baseline's own form; 30k-70k shares) barely moved
+  wash_trade F1 (0.777-0.790) because it over-flags busy tickers; 6x the
+  ticker's typical volume gave 0.871.
+- **The running-sum variance error was deciding some flags**, not just
+  moving z-scores by ~1e-6: computed directly, the Z-score flags ~5%
+  fewer ticks at the same recall (in-sample, z=5: 1,000 -> 951).
+- **The wash rule is now nearly redundant.** At ratio >= ~0.7 results
+  equal switching it off; lower ratios mostly add false alarms (0.2:
+  wash_trade F1 0.58-0.66). The time split in section 1 independently
+  picks the same 0.7 / 0.15%.
 
-**Risk threshold** (existing variants only; mean per-event F1 of the four
-tuning rows / original price_shock F1 / incident precision on the
-original data / alerts per ticker-hour):
+**Regressions.** No original anomaly type regresses against the
+previous round or the pre-change detector (price_shock 0.374 -> 0.392,
+wash_trade 0.698 -> 0.963, all days). Two harder price variants dip
+slightly against the previous round: **shock_ramp 0.225 -> 0.218** and
+**held-out shock_ramp_long 0.300 -> 0.290** (all days), mostly from the
+CUSUM restart (step 1: shock_ramp 0.205 -> 0.201 on the training split).
+Tick-level, the full detector now scores price_shock 0.275, wash_trade
+0.244, any 0.256 in-sample (previous round 0.256 / 0.101 / 0.135), on
+2.95% of ticks flagged (was 6.07%).
 
-| risk threshold | mean F1 | price_shock F1 | incident precision | alerts/h |
-|---|---|---|---|---|
-| 0.9 | 0.480 | 0.342 | 41.9% | 11.3 |
-| **1.0 (default)** | 0.472 | 0.374 | 52.1% | 8.8 |
-| 1.1 | 0.457 | 0.367 | 60.1% | 7.3 |
-| 1.5 | 0.369 | 0.266 | 81.2% | 4.6 |
-| 2.0 | 0.287 | 0.168 | 90.5% | 3.7 |
+**Incidents** (all days, default risk threshold 1.0):
 
-1.0 is the only value that doesn't regress an original row. One global
-threshold moves the families oppositely (raising it lifts wash-trade
-precision while price and ramp recall collapse), so it stays at 1.0 and
-`risk_score` is best used to rank alerts.
+| dataset | flagged ticks | incidents | incidents overlapping a real anomaly | events caught | alerts / ticker / hour | AAPL | GOOGL | MSFT | NVDA | TSLA |
+|---|---|---|---|---|---|---|---|---|---|---|
+| original | 2.95% | 1,103 | 72.0% | 71.8% | 6.8 | 5.6 | 4.3 | 4.7 | 12.2 | 7.1 |
+| + shock_ramp | 3.06% | 1,149 | 78.9% | 54.2% | 7.1 | 5.8 | 4.5 | 4.8 | 13.1 | 7.3 |
+| + wash_split | 5.70% | 1,823 | 70.1% | 72.3% | 11.2 | 9.9 | 7.0 | 7.2 | 20.3 | 11.7 |
+| + shock_ramp_long (held-out) | 3.05% | 1,189 | 81.2% | 56.9% | 7.3 | 5.8 | 4.6 | 5.0 | 13.4 | 7.8 |
+| + wash_split_fine (held-out) | 5.26% | 1,685 | 58.3% | 58.0% | 10.4 | 9.1 | 6.5 | 6.6 | 18.8 | 10.8 |
+
+On the test period alone (original data): 3.03% of ticks flagged, 338
+incidents, 72.2% overlapping a real anomaly, 73.7% of events caught, 7.1
+alerts per ticker-hour. Each dataset above is the original data plus that
+variant, so every row also contains the original anomalies. Alert rates
+scale with each ticker's trading activity (NVDA trades ~2-3x as often as
+the others).
+
+**Risk threshold** (training split; per-event F1 / incident precision
+and alerts per ticker-hour on the original data):
+
+| risk threshold | price_shock | wash_trade | shock_ramp | wash_split | incident precision | alerts/h |
+|---|---|---|---|---|---|---|
+| 0.9 | 0.339 | 0.941 | 0.267 | 0.842 | 58% | 8.5 |
+| **1.0 (default)** | 0.386 | 0.962 | 0.200 | 0.794 | 72% | 6.7 |
+| 1.1 | 0.381 | 0.973 | 0.165 | 0.732 | 79% | 5.9 |
+| 1.5 | 0.273 | 0.983 | 0.064 | 0.489 | 90% | 4.5 |
+| 2.0 | 0.172 | 0.969 | 0.022 | 0.244 | 94% | 3.9 |
+
+0.9 has the best mean F1 of the four rows but drops original
+price_shock F1 to 0.339; 1.0 is the best setting that doesn't regress an
+original row. Raising the threshold trades ramp and split recall for
+fewer, more precise alerts, so `risk_score` is best used to rank them.
 
 ### Calibration (in-sample, Z-score component)
 
 `python calibrate_thresholds.py` — z sweep at `window_size=20,
-min_samples=10, clip_k=5.0, vwap_threshold=0.01` with the EWMA and CUSUM
-signals switched off, price-shock detector only, tick-level, **tuned and
-scored on the full dataset**:
+min_samples=10, clip_k=5.0, vwap_threshold=0.01` with the EWMA, CUSUM and
+volume-spike signals switched off, price-shock detector only, tick-level,
+**tuned and scored on the full dataset**:
 
 | z_threshold | flagged | precision | recall | F1 |
 |---|---|---|---|---|
-| 3.0 | 6,785 | 5.45% | 63.68% | 0.101 |
-| 3.5 | 3,243 | 10.27% | 57.31% | 0.174 |
-| 4.0 | 1,879 | 15.43% | 49.91% | 0.236 |
-| 4.5 | 1,311 | 19.15% | 43.20% | 0.265 |
-| **5.0 (default)** | 1,000 | 22.70% | 39.07% | 0.287 |
-| 5.5 (F1 peak) | 820 | 24.88% | 35.11% | **0.291** |
-| 6.0 | 674 | 25.67% | 29.78% | 0.276 |
-| 7.0 | 503 | 27.44% | 23.75% | 0.255 |
+| 3.0 | 6,739 | 5.49% | 63.68% | 0.101 |
+| 3.5 | 3,196 | 10.42% | 57.31% | 0.176 |
+| 4.0 | 1,832 | 15.83% | 49.91% | 0.240 |
+| 4.5 | 1,264 | 19.86% | 43.20% | 0.272 |
+| **5.0 (default)** | 951 | 23.87% | 39.07% | 0.296 |
+| 5.5 (F1 peak) | 771 | 26.46% | 35.11% | **0.302** |
+| 6.0 | 625 | 27.68% | 29.78% | 0.287 |
+| 7.0 | 455 | 30.33% | 23.75% | 0.266 |
 
-`z=5.0` rather than the 5.5 peak because F1 is within 0.004 and recall
+`z=5.0` rather than the 5.5 peak because F1 is within 0.006 and recall
 is 4 points higher — a missed manipulation costs more than an extra
 alert an analyst dismisses. `vwap_threshold` barely matters (0.005-0.015
 moves F1 by < 0.01). The script also prints every signal at the job's
-defaults, tick-level (price_shock 0.256, wash_trade 0.101, any 0.135 —
-see the flag-volume regression above).
+defaults, tick-level (price_shock 0.275, wash_trade 0.244, any 0.256).
 
 For comparison, the pre-merge detector (100-tick window, 30-second
 tumbling-window wash rule) scored price_shock F1 0.061 and wash_trade F1
@@ -316,8 +359,7 @@ Calibration notes that still hold from earlier iterations:
   `test_baseline.py::test_shock_contamination_is_bounded_not_runaway`
   covers it. Instead every tick is included with **bounded influence**:
   its deviation is clipped to `--clip-k` standard deviations before it
-  enters the running mean/variance. VWAP's accumulators use the raw
-  price.
+  enters the window. VWAP's accumulators use the raw price.
 - **Z-score is the informative signal; VWAP divergence mostly isn't**
   for this injected shock style. It's kept as a secondary OR condition
   per the proposal's spec.
@@ -325,41 +367,41 @@ Calibration notes that still hold from earlier iterations:
 ### Out-of-sample evaluation (Z-score and wash-rule components)
 
 `python evaluate_generalization.py --sections split` (~90s). Sections
-1-3 study the Z-score and the wash rule (now with the scaled lookback),
-with the EWMA and CUSUM signals switched off, tick-level. The detector
-is causal (each tick is scored only against earlier ticks), so it runs
-once over the full timeline and the split is applied when scoring.
+1-3 study the Z-score and the wash rule (with the scaled lookback) on
+their own — the EWMA, CUSUM and volume-spike signals switched off —
+tick-level. The detector is causal (each tick is scored only against
+earlier ticks), so it runs once over the full timeline and the split is
+applied when scoring.
 
 **1. Time split.** Tuned on the first 70% of the timeline (to Sep 18
 16:58 UTC, 98,526 ticks); tested on the remaining 42,225. A random split
 would leak the future into the past. The tuning picked a 15-tick window,
-z=7.0, and wash ratio/range 0.5/0.2%. Tick-level, any anomaly:
+z=7.0, and wash ratio/range 0.7 / 0.15% (the defaults). Tick-level, any
+anomaly:
 
 | | precision | recall | F1 |
 |---|---|---|---|
-| Tuned detector, train (in-sample) | 31.6% | 42.5% | 0.363 |
-| **Tuned detector, test** | **28.6%** | **43.6%** | **0.346** |
-| Current defaults, test (chosen on all data, so leaky) | 20.5% | 52.1% | 0.294 |
+| Tuned components, train (in-sample) | 36.4% | 35.4% | 0.359 |
+| **Tuned components, test** | **32.1%** | **38.0%** | **0.348** |
+| Current defaults, test | 32.0% | 41.4% | 0.360 |
 | Naive fixed threshold, test | 14.1% | 47.6% | 0.217 |
-| Random at the detector's flag rate, test | 0.8% | 1.3% | 0.010 |
+| Random at the components' flag rate, test | 0.8% | 1.0% | 0.009 |
 
 Test F1 is within 0.02 of train F1, so the tuning is not overfit to the
-training period. With the scaled lookback, the training split prefers a
-stricter wash rule (ratio 0.5, range 0.2%) than the defaults (0.3,
-0.1%); the defaults were not re-tuned in this round.
+training period.
 
-**2. Baselines, per detector (test split, tick-level).**
+**2. Baselines, per component (test split, tick-level).**
 
-| | tuned detector F1 | naive F1 | random F1 | precision lift over random |
+| | tuned F1 | naive F1 | random F1 | precision lift over random |
 |---|---|---|---|---|
-| price_shock | 0.279 | **0.269** | 0.005 | 52x |
-| wash_trade | 0.420 | 0.186 | 0.005 | 88x |
+| price_shock (Z-score/VWAP) | 0.289 | **0.269** | 0.005 | 56x |
+| wash_trade (wash rule) | 0.430 | 0.186 | 0.004 | 120x |
 
-**On the original single-tick shocks, the rolling Z-score is barely
-better than flagging big tick-to-tick returns** — those shocks are
-single-tick jumps of 4-8 local sigma, which a return threshold catches
-just as well. (Per event, including the EWMA and CUSUM signals, the gap
-is a little wider: 0.374 vs 0.320.)
+**On the original single-tick shocks, the rolling Z-score alone is
+barely better than flagging big tick-to-tick returns** — those shocks
+are single-tick jumps of 4-8 local sigma, which a return threshold
+catches just as well. With every signal, per event, the gap is wider
+(test period 0.404 vs 0.286).
 
 **Leave-one-ticker-out** (tune on four tickers, all days; score the
 fifth). "Own-best" is the best F1 that ticker could reach if tuned on
@@ -367,76 +409,72 @@ itself:
 
 | held out | tuned window / z | shock F1 | own-best shock F1 | wash F1 | own-best wash F1 |
 |---|---|---|---|---|---|
-| AAPL | 15 / 6.5 | 0.302 | 0.302 | 0.496 | 0.498 |
-| GOOGL | 15 / 6.5 | 0.238 | 0.244 | 0.422 | 0.432 |
-| MSFT | 15 / 6.5 | 0.413 | 0.419 | 0.327 | 0.327 |
-| NVDA | 15 / 6.5 | 0.266 | 0.268 | 0.391 | 0.394 |
-| TSLA | 15 / 6.5 | 0.317 | 0.326 | 0.431 | 0.431 |
+| AAPL | 15 / 6.5 | 0.302 | 0.302 | 0.440 | 0.498 |
+| GOOGL | 15 / 6.5 | 0.238 | 0.244 | 0.428 | 0.432 |
+| MSFT | 15 / 6.5 | 0.413 | 0.466 | 0.288 | 0.327 |
+| NVDA | 20 / 5.5 | 0.259 | 0.272 | 0.394 | 0.397 |
+| TSLA | 15 / 6.5 | 0.358 | 0.369 | 0.436 | 0.491 |
 
-Every fold picks the same window and z, and every ticker is within 0.01
-of its own best on both detectors. Before the lookback was scaled to the
-trading rate (3c), NVDA's held-out wash F1 was 0.118 against an own-best
-of 0.250 — a fixed 2-minute lookback spans ~11 NVDA ticks but ~4-6 for
-the others.
+The threshold carries over across stocks: shock F1 is within 0.05 and
+wash F1 within 0.06 of each ticker's own best. Before the lookback was
+scaled to the trading rate, NVDA's held-out wash F1 was 0.118 against an
+own-best of 0.250 — a fixed 2-minute lookback spans ~11 NVDA ticks but
+~4-6 for the others.
 
 **3. Precision-recall over z** (15-tick window, price_shock,
 tick-level):
 
 | z | train P | train R | train F1 | test P | test R | test F1 |
 |---|---|---|---|---|---|---|
-| 3.0 | 5.0% | 67.4% | 0.094 | 5.7% | 76.5% | 0.107 |
-| 4.0 | 12.5% | 55.2% | 0.204 | 14.6% | 63.7% | 0.237 |
-| 5.0 | 18.1% | 46.5% | 0.261 | 19.6% | 54.2% | 0.288 |
-| 6.0 | 22.4% | 38.3% | 0.283 | 22.5% | 45.3% | 0.301 |
-| 7.0 | 26.3% | 34.1% | 0.297 | 22.2% | 37.4% | 0.279 |
-| 8.0 | 28.2% | 27.6% | 0.279 | 21.9% | 30.7% | 0.256 |
+| 3.0 | 5.1% | 67.4% | 0.094 | 5.8% | 76.5% | 0.108 |
+| 4.0 | 12.7% | 55.2% | 0.206 | 15.0% | 63.7% | 0.242 |
+| 5.0 | 18.6% | 46.5% | 0.266 | 20.3% | 54.2% | 0.296 |
+| 6.0 | 23.4% | 38.3% | 0.291 | 23.7% | 45.3% | 0.311 |
+| 7.0 | 27.5% | 34.1% | 0.304 | 23.5% | 37.4% | 0.289 |
+| 8.0 | 30.3% | 27.6% | 0.289 | 23.4% | 30.7% | 0.266 |
 
-Test F1 stays within 0.28-0.30 across z = 5.0-7.0, so the default z=5 sits
-on a broad plateau rather than a lucky point.
+Test F1 stays within 0.29-0.31 across z = 5.0-7.0, so the default z=5
+sits on a broad plateau rather than a lucky point.
 
 ### Known limitations
 
-- **Injected ramps are about a one-standard-deviation move, which caps
-  any price-only detector.** Normal prices in this data trend: tick-to-
-  tick price changes have lag-1 autocorrelation +0.12 to +0.28, and over
-  15 ticks normal price changes have a standard deviation of 5-7x the
-  tick sigma (a random walk would give 3.9x). The injected ramps move a
-  total of 4-8 tick sigma, so a ramp looks like an ordinary one-sd
-  trend. Every price-only ramp signal tried here (fast-vs-slow EWMA,
-  price CUSUM, the rolling window against a slow EWMA) trades ramp
-  recall directly against false alarms on normal trending periods; ramp
-  recall stays at 17% (existing) and 24% (held-out).
-- **The price CUSUM (k=2, h=6) is a small regression on the original
-  shocks.** It raises ramp F1 from 0.183 to 0.225 (per event, existing
-  variants) but lowers original price_shock F1 from 0.378 to 0.374
-  (precision 34.1% -> 33.1%, recall 42.3% -> 42.9%). At lower
-  allowances (k <= 1) it floods normal trending periods with flags
-  (original price_shock precision 2-16%).
-- **Noisier output.** ~6% of ticks are flagged (the CUSUMs keep firing
-  through a burst); use `incident_id` and `risk_score` to group and rank
-  them. ~9 alerts per ticker-hour on the original data, ~17 for NVDA,
-  and about half of incidents overlap a real anomaly.
-- **A plain volume threshold beats the detector on the original wash
-  trades** (0.872 vs 0.698 per event), and the Z-score is barely better
-  than a return threshold on the original price shocks. The detector's
-  advantage is on the harder, spread-out variants.
-- **One global risk threshold** moves the two families in opposite
+- **Slow ramps stay hard; injected ramps are about a one-standard-
+  deviation move, which caps any price-only detector.** Normal prices in
+  this data trend: tick-to-tick price changes have lag-1 autocorrelation
+  +0.12 to +0.28, and over 15 ticks normal price changes have a standard
+  deviation of 5-7x the tick sigma (a random walk would give 3.9x). The
+  injected ramps move a total of 4-8 tick sigma, so a ramp looks like an
+  ordinary one-sd trend. Every price-only ramp signal tried here
+  (fast-vs-slow EWMA, price CUSUM, the rolling window against a slow
+  EWMA) trades ramp recall directly against false alarms on normal
+  trending periods; ramp recall stays around 17-30%.
+- **The price CUSUM (k=2, h=6) was a small regression on the original
+  shocks when added** (price_shock F1 0.378 -> 0.374, per event, existing
+  variants), traded for ramp F1 0.183 -> 0.225. At lower allowances
+  (k <= 1) it floods normal trending periods with flags (original
+  price_shock precision 2-16%). Later changes more than recovered the
+  original-shock loss (now 0.392).
+- **Restarting the CUSUMs costs a little ramp recall** (shock_ramp F1
+  0.225 -> 0.218, held-out shock_ramp_long 0.300 -> 0.290, all days) in
+  exchange for half the flag volume.
+- **Still a noisy output.** ~3% of ticks are flagged (~5-6% when split
+  wash trades are present); use `incident_id` and `risk_score` to group
+  and rank them. ~7 alerts per ticker-hour on the original data, ~12 for
+  NVDA; about 72% of incidents overlap a real anomaly.
+- **Finely split wash trades are only partly caught** (held-out 1.2-2x
+  prints: recall ~30%): prints that close to normal volume look like an
+  ordinary busy, flat stretch.
+- **One global risk threshold** moves the families in opposite
   directions (see the risk-threshold table); per-family or per-ticker
   thresholds are a possible v2.
-- **The wash rule is really a volume-spike-in-a-flat-market detector.**
-  Real wash trading means the same beneficial owner on both sides, which
-  the data can't show. It will flag legitimate block trades in a quiet
-  market, and the volume CUSUM will flag busy flat stretches.
+- **The volume signals are really volume-spike-in-a-flat-market
+  detectors.** Real wash trading means the same beneficial owner on both
+  sides, which the data can't show. They will flag legitimate block
+  trades and busy flat stretches.
 - **Synthetic labels.** All numbers are against injected anomalies on
   real-anchored synthetic ticks, and the held-out variants come from the
   same injector design with different parameters. Real market data would
   need re-checking.
-- **Running-sum variance is numerically fragile.** The rolling window's
-  variance is `sum_sq/n - mean^2` from running sums, which cancels
-  badly at price levels of 100-500 with tick-level spreads: a one-ulp
-  change in an input price moves later z-scores by ~1e-6. No flag has
-  changed because of it, but recomputing mean/variance directly from the
-  (at most 20-tick) window would remove it.
 
 ## Setup
 
@@ -460,12 +498,16 @@ the checkpoint path: `--checkpoint-dir` (default
 the job then starts from a fresh directory instead of failing on the old
 one. A fresh checkpoint also means the query starts from
 `--starting-offsets` again and every ticker's baseline re-warms.
-Current version: 5. v1: pickled blob only. v2: + typed CUSUM fields.
+Current version: 6. v1: pickled blob only. v2: + typed CUSUM fields.
 v3: + trading rate (blob). v4: + open incident (blob). v5: + tick_id
-sequence (blob). The typed fields are Spark schema changes; the blob
-additions are read with defaults by `load_state`, but the version is
-bumped for those too, because resumed state from an older detector
-isn't what the new one expects.
+sequence (blob). v6: trading rate, open incident and tick_id sequence
+move from the blob to typed fields (14 typed fields in all; the blob
+keeps the window lists and the baseline/EWMA scalars). The typed fields
+are Spark schema changes; the blob additions are read with defaults by
+`load_state`, but the version is bumped for those too, because resumed
+state from an older detector isn't what the new one expects. (Dropping
+the old running variance sums didn't bump it: a v6 state stays exactly
+valid.)
 
 ### Recommended: the Docker stack (known-working Kafka + Spark)
 
@@ -547,7 +589,8 @@ matters: pandas' default CSV float parser isn't correctly rounded, so
 writing a slice and reading it back shifts some long decimals by one ulp
 (61 of 27,923 prices on Sep 16, all NVDA). Scored from the original
 parse instead, 5,498 z-scores differed by ~1e-6 while every flag still
-matched — see Known limitations on running-sum variance.
+matched. That sensitivity came from the old running-sum variance, which
+has since been replaced by a direct computation from the window.
 
 **Results** (final detector, current defaults, 2000 records per
 micro-batch). Every output field is compared: `price`, `volume`,
@@ -558,8 +601,8 @@ micro-batch). Every output field is compared: `price`, `volume`,
 
 | slice | ticks | micro-batches | rows out (Spark / offline) | mismatches, all 13 fields | flags (shock / wash) |
 |---|---|---|---|---|---|
-| Sep 16 | 27,923 | 14 | 27,923 / 27,923 | 0 | 213 / 1,592 both |
-| Sep 16-17 (crosses an overnight gap) | 55,171 | 28 | 55,171 / 55,171 | 0 | 477 / 2,792 both |
+| Sep 16 | 27,923 | 14 | 27,923 / 27,923 | 0 | 202 / 661 both |
+| Sep 16-17 (crosses an overnight gap) | 55,171 | 28 | 55,171 / 55,171 | 0 | 427 / 1,196 both |
 
 Late drops and watermark drops were 0. After each run only `market-ticks`
 and the pre-existing `verify-ordering-checker` group remain on the
@@ -617,9 +660,11 @@ overnight gap reset (a day's close then the next morning's open), late
 ticks (reordered within a batch; dropped and counted across batches,
 including a replay with stragglers held back a batch), loading both
 earlier checkpoint state layouts, the EWMA and CUSUM signals (typed
-CUSUM state, ramps, split prints in a flat market, reset when price
-moves, gap reset), the trading-rate lookback, the risk score and
-incident grouping, `tick_id`, and the versioned checkpoint path.
+state, ramps, split prints in a flat market, reset when price moves,
+restart after firing, gap reset), the volume spike, the trading-rate
+lookback, the risk score and incident grouping, `tick_id`, one-ulp
+input insensitivity of the Z-score, and the versioned checkpoint
+path.
 `test_parity_check.py` covers the parity comparison itself. Fast (~2s),
 good for iterating on the detection logic itself.
 
@@ -632,9 +677,9 @@ python calibrate_thresholds.py
 Sweeps the Z-score and VWAP-divergence thresholds (values hardcoded in
 the script, not CLI flags) against the full labeled dataset offline —
 same `make_baseline_update_fn` the Spark job runs — and reports
-precision/recall/F1 per combination (EWMA and CUSUM signals off, so
-the sweep isolates the Z-score), plus every signal at the job's
-defaults. This produced the Calibration numbers above exactly; doesn't
+precision/recall/F1 per combination (EWMA, CUSUM and volume-spike
+signals off, so the sweep isolates the Z-score), plus every signal at
+the job's defaults. This produced the Calibration numbers above exactly; doesn't
 change any defaults in `detect_anomalies.py`, it only reports.
 
 ### Out-of-sample evaluation
@@ -642,10 +687,12 @@ change any defaults in `detect_anomalies.py`, it only reports.
 ```bash
 python evaluate_generalization.py                          # sections 1-4
 python evaluate_generalization.py --sections variants      # per-event + incidents only
-python evaluate_generalization.py --heldout --naive        # final scoring
+python evaluate_generalization.py --sections variants --period train  # tuning
+python evaluate_generalization.py --heldout --naive --period test      # final scoring
 ```
 
 Time split, leave-one-ticker-out, baselines, precision-recall over z,
 per-event and per-incident scores on the harder variants — produces the
-evaluation tables above (~2-3 min, pandas only). Only pass `--heldout`
-for final scoring; never tune against it.
+evaluation tables above (~2-3 min, pandas only). Tune with
+`--period train` only; `--period test` and `--heldout` are for final
+scoring.

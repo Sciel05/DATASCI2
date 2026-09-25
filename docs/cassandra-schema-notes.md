@@ -39,15 +39,17 @@ nullable in the Spark schema; the notes say when each is actually null.
 | `is_anomaly` | boolean | `boolean` | never | `risk_score > --risk-threshold` (default 1.0) |
 | `anomaly_type` | string | `text` | not flagged | `price_shock` or `wash_trade` only |
 | `ewma_divergence` | double | `double` | first 50 ticks after start/gap | Fast-minus-slow price EWMA, in units of its recent RMS (ramp signal) |
-| `cusum_price` | double | `double` | first 50 ticks after start/gap | Price CUSUM, `max(up, down)`, in tick-sigma units |
-| `cusum_volume` | double | `double` | first 50 ticks after start/gap | Volume CUSUM (flat-market gated), in log-volume sd units |
+| `cusum_price` | double | `double` | first 50 ticks after start/gap | Price CUSUM, `max(up, down)`, in tick-sigma units; the side that fires restarts at 0 on the next tick (the firing row keeps the value that fired) |
+| `cusum_volume` | double | `double` | first 50 ticks after start/gap | Volume CUSUM (flat-market gated), in log-volume sd units; restarts at 0 on the next tick after it fires |
 | `risk_score` | double | `double` | never (0.0 while nothing is scored) | Largest signal as a multiple of its own alarm level |
-| `signals` | string | `text` (or `set<text>` after splitting on `,`) | not flagged | Comma-separated signals above the threshold: any of `zscore`, `vwap`, `ewma`, `cusum_price`, `wash_rule`, `cusum_volume` |
+| `signals` | string | `text` (or `set<text>` after splitting on `,`) | not flagged | Comma-separated signals above the threshold: any of `zscore`, `vwap`, `ewma`, `cusum_price`, `wash_rule`, `cusum_volume`, `volume_spike` |
 | `incident_id` | string | `text` | not flagged | `<ticker>-<first flag's event_time_ms>`; consecutive flags on a ticker share it |
 | `tick_id` | string | `text` | never | `<ticker>-<event_time_ms>-<seq>`, unique per tick, stable across retries |
 
 The first eight fields are the original contract and are unchanged; the
-last seven were appended.
+last seven were appended. Since the first version of this note no field
+was added, removed or retyped; `signals` gained the value
+`volume_spike`, and the two CUSUM fields now restart after firing.
 
 ## Suggested key
 
