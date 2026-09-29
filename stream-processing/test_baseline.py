@@ -1,0 +1,654 @@
+"""
+Unit tests for the per-ticker rolling baseline logic in detect_anomalies.py.
+
+Drives make_baseline_update_fn directly with a fake GroupState, bypassing
+Spark's streaming runtime (and its checkpoint directory requirement -- see
+the Windows-local dev note in README.md) so the core stateful algorithm can
+be iterated on and verified without a Kafka+Spark cluster.
+
+Run with: python -m pytest test_baseline.py -v
+"""
+import pickle
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from detect_anomalies import (
+    TYPED_STATE_NAMES,
+    STATE_LAYOUT_VERSION,
+    checkpoint_path,
+    load_state,
+    make_baseline_update_fn,
+)
+
+
+def std_from_state(state):
+    clipped = [c for _raw, c, _vol in load_state(state)["window"]]
+    mean = sum(clipped) / len(clipped)
+    return (sum((c - mean) ** 2 for c in clipped) / len(clipped)) ** 0.5
+
+
+class FakeState:
+    """Minimal stand-in for pyspark.sql.streaming.state.GroupState."""
+
+    def __init__(self):
+        self._value = None
+
+    @property
+    def exists(self):
+        return self._value is not None
+
+    @property
+    def get(self):
+        return self._value
+
+    def update(self, value):
+        self._value = value
+
+
+def make_ticks(specs, ticker="AAPL", start_ms=1_700_000_000_000, step_ms=1000):
+    """specs: list of (price, volume) tuples -> DataFrame in the shape the
+    state function expects (one row per tick, columns matching the parsed
+    Kafka payload plus event_time)."""
+    rows = []
+    for i, (price, volume) in enumerate(specs):
+        ms = start_ms + i * step_ms
+        rows.append(
+            {
+                "ticker": ticker,
+                "event_time_ms": ms,
+                "event_time": pd.Timestamp(ms, unit="ms"),
+                "price": price,
+                "volume": volume,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run(fn, pdf, state=None):
+    state = state or FakeState()
+    out = pd.concat(list(fn(("AAPL",), iter([pdf]), state)), ignore_index=True)
+    return out, state
+
+
+def test_warmup_period_is_unscored():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=3.0, vwap_threshold=0.003)
+    pdf = make_ticks([(100.0, 100.0)] * 9)
+    out, _ = run(fn, pdf)
+    assert out["zscore"].isna().all()
+    assert out["is_anomaly"].eq(False).all()
+
+
+def test_shock_tick_flagged_with_high_zscore():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=3.0, vwap_threshold=0.003)
+    specs = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(40)]
+    specs.append((500.0, 100.0))
+    pdf = make_ticks(specs)
+    out, _ = run(fn, pdf)
+    shock_row = out.iloc[-1]
+    assert shock_row["is_anomaly"]
+    assert shock_row["anomaly_type"] == "price_shock"
+    assert shock_row["zscore"] > 3.0
+
+
+def test_shock_contamination_is_bounded_not_runaway():
+    """Regression test for a bug found by replaying the real labeled dataset
+    through this function: an earlier version excluded flagged ticks from
+    ever entering the baseline window (intended to stop a shock from
+    dragging the baseline for the following window_size ticks). On real
+    data that exclusion instead caused an UNBOUNDED feedback loop -- once a
+    tick is excluded, the window's variance estimate shrinks, which makes
+    the next tick more likely to be excluded too, compounding until ~89%%
+    of all ticks were flagged (see stream-processing/README.md). Flagged
+    ticks must be included in the window like any other tick (their
+    contribution to the mean/variance accumulators clipped, not excluded --
+    see test_bounded_influence_limits_baseline_widening_after_shock), so a
+    shock's influence decays and disappears once it ages out of the window,
+    rather than compounding forever."""
+    window_size, min_samples = 100, 30
+    fn = make_baseline_update_fn(
+        window_size=window_size, min_samples=min_samples, z_threshold=3.0, vwap_threshold=0.01
+    )
+    stable = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(150)]
+    shock = [(500.0, 100.0)]
+    recovery = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(150)]
+    pdf = make_ticks(stable + shock + recovery)
+    out, _ = run(fn, pdf)
+
+    shock_idx = len(stable)
+    # Well after the shock has aged out of the window (window_size ticks
+    # later), scoring must have fully recovered -- this is the part that a
+    # runaway feedback loop would fail.
+    tail = out.iloc[shock_idx + window_size + 20 :]
+    assert not tail["is_anomaly"].any(), "flagging did not recover after the shock aged out of the window"
+
+
+def test_bounded_influence_limits_baseline_widening_after_shock():
+    """The specific failure mode bounded-influence clipping targets: folding
+    a shock's *raw* price into the running mean/variance (rather than
+    clipping its deviation first) blows the window's variance estimate wide
+    open for as long as the shock sits in the window. Compare the window's
+    std immediately before vs. immediately after the shock -- with clipping,
+    a single tick can widen std by at most a small, bounded amount (roughly
+    clip_k**2 / window_size worth of variance); without clipping, folding in
+    a ~500 vs ~100 outlier would widen std by roughly two orders of
+    magnitude."""
+    window_size, min_samples, clip_k = 100, 30, 5.0
+    fn = make_baseline_update_fn(
+        window_size=window_size,
+        min_samples=min_samples,
+        z_threshold=3.0,
+        vwap_threshold=0.01,
+        clip_k=clip_k,
+    )
+    stable = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(150)]
+    state = FakeState()
+    _, state = run(fn, make_ticks(stable), state=state)
+    std_before = std_from_state(state)
+    assert std_before > 0
+
+    shock_pdf = make_ticks([(500.0, 100.0)], start_ms=1_700_000_000_000 + len(stable) * 1000)
+    _, state = run(fn, shock_pdf, state=state)
+    std_after = std_from_state(state)
+
+    # Bounded: a single clipped tick nudges std by a small amount. Unbounded
+    # inclusion of a raw 500-vs-~100 outlier into a 100-tick window would
+    # roughly 400x the std (from ~0.1 to ~40) -- well outside this bound.
+    assert std_after < std_before * 2, (
+        f"baseline widened too much after one shock: std {std_before:.4f} -> {std_after:.4f} "
+        "(expected bounded growth, not the unbounded blow-up clipping is meant to prevent)"
+    )
+
+
+def test_window_evicts_oldest_and_vwap_sums_stay_consistent():
+    # Small, steady drift (0.001/tick) so neither the Z-score nor VWAP-divergence
+    # threshold trips -- a *monotonic* drift on the order of the price itself
+    # (e.g. +1 on a ~100 base) diverges from the windowed VWAP fast enough to
+    # get every post-warmup tick excluded from the window, which would make
+    # this a test of the anomaly gate rather than of FIFO eviction.
+    prices_in = [round(100.0 + 0.001 * i, 3) for i in range(12)]
+    fn = make_baseline_update_fn(window_size=5, min_samples=3, z_threshold=3.0, vwap_threshold=0.003)
+    pdf = make_ticks([(p, 10.0) for p in prices_in])
+    out, state = run(fn, pdf)
+    assert out["is_anomaly"].eq(False).all(), "small steady drift should not trip either threshold"
+
+    st = load_state(state)
+    raw_prices = [w[0] for w in st["window"]]
+    clipped_prices = [w[1] for w in st["window"]]
+    assert len(st["window"]) == 5
+    assert raw_prices == prices_in[-5:]
+    assert clipped_prices == raw_prices  # no shock, so nothing was clipped
+    assert "sum_price" not in st and "sum_sq" not in st  # computed from the window now
+    assert abs(st["sum_pv"] - sum(p * 10.0 for p in raw_prices)) < 1e-6
+    assert abs(st["sum_v"] - 50.0) < 1e-9
+
+
+def test_state_round_trips_across_batches():
+    """A second call with a fresh iterator must resume from the previous
+    call's saved state rather than starting cold."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=3.0, vwap_threshold=0.003)
+    first_batch = make_ticks([(100.0, 100.0)] * 15, start_ms=1_700_000_000_000)
+    out1, state = run(fn, first_batch)
+    assert out1.iloc[-1]["zscore"] is not None
+
+    second_batch = make_ticks([(100.0, 100.0)], start_ms=1_700_000_020_000)
+    out2, state = run(fn, second_batch, state=state)
+    assert not out2.empty
+    assert len(load_state(state)["window"]) == 16
+
+
+def test_wash_trade_flagged_for_large_print_into_flat_market():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    # flat price, modest volume, then one outsized print at the same price
+    specs = [(100.0, 100.0)] * 15 + [(100.0, 5000.0)]
+    out, _ = run(fn, make_ticks(specs))
+    wash_row = out.iloc[-1]
+    assert wash_row["is_anomaly"]
+    assert wash_row["anomaly_type"] == "wash_trade"
+    assert not out.iloc[:-1]["is_anomaly"].any()
+
+
+def test_wash_trade_not_flagged_when_market_is_moving():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    # trailing prices span ~1% -- well over the 0.1% flatness limit
+    specs = [(100.0 + (0.5 if i % 2 == 0 else -0.5), 100.0) for i in range(15)]
+    specs.append((100.0, 5000.0))
+    out, _ = run(fn, make_ticks(specs))
+    assert out.iloc[-1]["anomaly_type"] != "wash_trade"
+
+
+def test_wash_trade_lookback_ignores_ticks_older_than_window():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01, wash_lookback_ms=10_000
+    )
+    # a big-volume history that ages out of the 10s lookback, then small flat
+    # ticks: the final print is only large relative to what's still in range
+    old = make_ticks([(100.0, 100_000.0)] * 5, start_ms=1_700_000_000_000)
+    recent = make_ticks([(100.0, 100.0)] * 5 + [(100.0, 1000.0)], start_ms=1_700_000_060_000)
+    out, _ = run(fn, pd.concat([old, recent], ignore_index=True))
+    assert out.iloc[-1]["anomaly_type"] == "wash_trade"
+
+
+def test_price_shock_takes_precedence_over_wash_trade():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=3.0, vwap_threshold=0.01)
+    specs = [(100.0 + (0.01 if i % 2 == 0 else -0.01), 100.0) for i in range(15)]
+    specs.append((150.0, 5000.0))  # both a huge move and an outsized print
+    out, _ = run(fn, make_ticks(specs))
+    assert out.iloc[-1]["anomaly_type"] == "price_shock"
+
+
+def test_wash_history_round_trips_across_batches():
+    """The trailing wash-trade lookback must survive a micro-batch boundary --
+    the reason this heuristic lives in the stateful function rather than a
+    per-batch window."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    first = make_ticks([(100.0, 100.0)] * 15, start_ms=1_700_000_000_000)
+    _, state = run(fn, first)
+    second = make_ticks([(100.0, 5000.0)], start_ms=1_700_000_015_000)
+    out2, _ = run(fn, second, state=state)
+    assert out2.iloc[0]["anomaly_type"] == "wash_trade"
+
+
+@pytest.mark.parametrize("n_fields", [5, 6])
+def test_resumes_from_legacy_tuple_state_blob(n_fields):
+    """Checkpoints written by earlier versions hold a positional tuple (5
+    fields before the wash-trade detector moved in, 6 after) in a one-field
+    state; both must still load, and be re-saved in the current layout: a
+    pickled dict plus the typed CUSUM fields."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    state = FakeState()
+    legacy = ([(100.0, 100.0, 100.0)] * 12, 1200.0, 120000.0, 120000.0, 1200.0, [])[:n_fields]
+    state.update((pickle.dumps(legacy),))
+    out, state = run(fn, make_ticks([(100.0, 100.0)]), state=state)
+    assert out.iloc[0]["zscore"] is not None, "resumed baseline should already be warm"
+    blob, *typed = state.get
+    saved = pickle.loads(blob)
+    assert isinstance(saved, dict)
+    assert len(saved["window"]) == 13
+    assert saved["late_dropped"] == 0
+    assert len(typed) == len(TYPED_STATE_NAMES)
+    assert dict(zip(TYPED_STATE_NAMES, typed))["cusum_n"] == 1  # the legacy state had no CUSUM history
+
+
+# --- overnight gap reset
+
+
+def test_gap_resets_baseline_so_open_is_not_scored_against_prior_close():
+    """Feed a day's close, then the next morning's open ~17.5h later at a
+    very different price level. Without a reset the first morning ticks
+    would be scored against yesterday's close (a huge z-score and a false
+    price_shock). With it, the morning re-warms from scratch."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    close_ms = 1_700_000_000_000
+    close = make_ticks(
+        [(100.0 + (0.01 if i % 2 == 0 else -0.01), 100.0) for i in range(30)], start_ms=close_ms
+    )
+    open_ms = close_ms + 30 * 1000 + int(17.5 * 3600 * 1000)
+    morning = make_ticks(
+        [(110.0 + (0.01 if i % 2 == 0 else -0.01), 100.0) for i in range(15)], start_ms=open_ms
+    )
+
+    _, state = run(fn, close)
+    assert len(load_state(state)["window"]) == 20
+    out, state = run(fn, morning, state=state)
+
+    # first min_samples morning ticks are warm-up: unscored, never flagged
+    assert out.iloc[:10]["zscore"].isna().all()
+    assert not out["is_anomaly"].any()
+    # the baseline now holds only morning ticks
+    assert all(raw >= 109.0 for raw, _clipped, _vol in load_state(state)["window"])
+
+
+def test_gap_reset_is_configurable_and_short_gaps_keep_the_baseline():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01, gap_reset_ms=60_000
+    )
+    first = make_ticks([(100.0, 100.0)] * 12, start_ms=1_700_000_000_000)
+    _, state = run(fn, first)
+    # 50s later: under the 60s reset, the baseline carries over
+    after_short = make_ticks([(100.0, 100.0)], start_ms=1_700_000_011_000 + 50_000)
+    out, state = run(fn, after_short, state=state)
+    assert out.iloc[0]["zscore"] is not None
+    # 2 min later: over it, the baseline resets
+    after_long = make_ticks([(100.0, 100.0)], start_ms=1_700_000_061_000 + 120_000)
+    out, state = run(fn, after_long, state=state)
+    assert out.iloc[0]["zscore"] is None
+    assert len(load_state(state)["window"]) == 1
+
+
+# --- late / out-of-order ticks
+
+
+def test_out_of_order_ticks_within_a_batch_are_reordered_not_dropped():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    specs = [(100.0 + 0.01 * (i % 3), 100.0 + i) for i in range(40)]
+    in_order = make_ticks(specs)
+    shuffled = in_order.sample(frac=1.0, random_state=3).reset_index(drop=True)
+
+    expected, _ = run(fn, in_order)
+    out, state = run(fn, shuffled)
+    assert len(out) == 40
+    assert load_state(state)["late_dropped"] == 0
+    pd.testing.assert_frame_equal(out, expected)
+
+
+def test_tick_older_than_previous_batch_is_dropped_and_counted():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    ticks = make_ticks([(100.0, 100.0)] * 20)
+    _, state = run(fn, ticks.iloc[:15])
+    # batch 2 carries one straggler from before batch 1's last tick
+    late = ticks.iloc[[7]]
+    out, state = run(fn, pd.concat([late, ticks.iloc[15:]], ignore_index=True), state=state)
+
+    assert len(out) == 5, "the straggler must not be emitted"
+    assert load_state(state)["late_dropped"] == 1
+    assert len(load_state(state)["window"]) == 20  # 15 + 5, straggler excluded
+
+
+def test_same_timestamp_as_last_tick_is_not_late():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    ticks = make_ticks([(100.0, 100.0)] * 10)
+    _, state = run(fn, ticks)
+    same_ms = ticks.iloc[[-1]]
+    out, state = run(fn, same_ms, state=state)
+    assert len(out) == 1
+    assert load_state(state)["late_dropped"] == 0
+
+
+def test_replay_with_shuffled_stragglers_drops_exactly_the_late_ones():
+    """Replay 300 ticks in 50-tick micro-batches, but hold a few ticks back
+    and deliver them one batch late -- the way a slow partition or a retry
+    would. Exactly those ticks are dropped and counted; everything else is
+    emitted, and the running count survives across batches."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    ticks = make_ticks([(100.0 + 0.01 * (i % 5), 100.0) for i in range(300)])
+    batches = [ticks.iloc[i : i + 50] for i in range(0, 300, 50)]
+    held_back = {1: [10, 20, 30], 3: [5]}  # batch index -> row offsets delivered a batch late
+
+    state = FakeState()
+    emitted = 0
+    carry = None
+    for b, batch in enumerate(batches):
+        late_rows = batch.iloc[held_back.get(b, [])]
+        on_time = batch.drop(index=late_rows.index)
+        feed = on_time if carry is None else pd.concat([carry, on_time])
+        out, state = run(fn, feed.reset_index(drop=True), state=state)
+        emitted += len(out)
+        carry = late_rows if len(late_rows) else None
+
+    assert load_state(state)["late_dropped"] == 4
+    assert emitted == 300 - 4
+
+
+# --- CUSUM detectors (typed state)
+
+
+def noisy(base, n, step=0.01, seed=0):
+    """Alternating +/- step around `base` with a little seeded jitter, so the
+    slow tick-sigma and log-volume statistics are non-degenerate."""
+    rng = np.random.default_rng(seed)
+    return [base + (step if i % 2 == 0 else -step) + rng.normal(0, step / 4) for i in range(n)]
+
+
+def test_scalar_state_is_typed_fields_not_pickle():
+    """CUSUM, trading-rate, incident and tick_id state are typed Spark
+    fields; none of them is also pickled into the blob."""
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    specs = [(p, 100.0) for p in noisy(100.0, 30)] + [(150.0, 100.0)]  # a shock opens an incident
+    _, state = run(fn, make_ticks(specs))
+    blob, *typed = state.get
+    assert len(typed) == len(TYPED_STATE_NAMES)
+    typed = dict(zip(TYPED_STATE_NAMES, typed))
+    assert typed["cusum_n"] == 31
+    assert typed["rate_n"] == 30
+    assert typed["rate_dt_ms"] == 1000.0
+    assert typed["incident_id"] is not None and typed["incident_id"].startswith("AAPL-")
+    assert typed["ticks_since_flag"] == 0
+    assert typed["same_ts_seq"] == 0
+    assert not set(TYPED_STATE_NAMES) & set(pickle.loads(blob))
+
+
+def test_price_cusum_flags_a_steady_ramp_after_warmup():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        cusum_k=0.5, cusum_h=8.0,
+    )
+    flat = noisy(100.0, 80)
+    ramp = [flat[-1] + 0.02 * (i + 1) for i in range(30)]  # ~2 tick-sigma per tick, one direction
+    out, _ = run(fn, make_ticks([(p, 100.0) for p in flat + ramp]))
+    assert not out.iloc[:80]["is_anomaly"].any()
+    assert out.iloc[80:]["anomaly_type"].eq("price_shock").any()
+
+
+def test_cusums_restart_from_zero_after_firing():
+    """A CUSUM that fires restarts at zero, so a long ramp or burst raises
+    one alarm per accumulation instead of one per tick."""
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_k=0.5, cusum_h=8.0, cusum_volume_k=0.5, cusum_volume_h=5.0,
+    )
+    flat = noisy(100.0, 80)
+    ramp = [flat[-1] + 0.02 * (i + 1) for i in range(60)]
+    out, _ = run(fn, make_ticks([(p, 100.0) for p in flat + ramp]))
+    fires = np.flatnonzero(out["signals"].fillna("").str.contains("cusum_price").to_numpy())
+    assert len(fires) >= 2
+    assert len(fires) < 60 / 4  # nowhere near one alarm per ramp tick
+    for i in fires:
+        assert out.loc[i, "cusum_price"] > 8.0  # the output keeps the value that fired
+        if i + 1 < len(out):
+            assert out.loc[i + 1, "cusum_price"] < 8.0  # restarted
+
+    rng = np.random.default_rng(1)
+    calm = [(100.0 + rng.normal(0, 0.001), 100.0 * np.exp(rng.normal(0, 0.3))) for _ in range(80)]
+    burst = [(100.0 + rng.normal(0, 0.001), 300.0) for _ in range(40)]
+    out, _ = run(fn, make_ticks(calm + burst))
+    vfires = np.flatnonzero(out["signals"].fillna("").str.contains("cusum_volume").to_numpy())
+    assert 1 <= len(vfires) < 40 / 2
+    for i in vfires:
+        if i + 1 < len(out):
+            assert out.loc[i + 1, "cusum_volume"] < 5.0
+
+
+def test_volume_cusum_flags_split_prints_in_a_flat_market():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_h=1e9, cusum_volume_k=0.5, cusum_volume_h=5.0,
+    )
+    rng = np.random.default_rng(1)
+    calm = [(100.0 + rng.normal(0, 0.001), 100.0 * np.exp(rng.normal(0, 0.3))) for _ in range(80)]
+    split = [(100.0 + rng.normal(0, 0.001), 300.0) for _ in range(20)]  # 3x volume, no single outsized print
+    out, _ = run(fn, make_ticks(calm + split))
+    assert not out.iloc[:80]["is_anomaly"].any()
+    assert out.iloc[80:]["anomaly_type"].eq("wash_trade").any()
+
+
+def test_volume_cusum_resets_when_price_moves():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_h=1e9, cusum_volume_k=0.5, cusum_volume_h=5.0,
+    )
+    rng = np.random.default_rng(1)
+    calm = [(100.0 + rng.normal(0, 0.001), 100.0 * np.exp(rng.normal(0, 0.3))) for _ in range(80)]
+    # same elevated volume, but price swinging ~1%: not a flat market
+    moving = [(100.0 + (0.5 if i % 2 == 0 else -0.5), 300.0) for i in range(20)]
+    out, _ = run(fn, make_ticks(calm + moving))
+    assert (out.iloc[81:]["cusum_volume"] == 0).all()
+    assert not out.iloc[80:]["anomaly_type"].eq("wash_trade").any()
+
+
+def test_gap_reset_also_resets_cusum_state():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    close_ms = 1_700_000_000_000
+    close = make_ticks([(p, 100.0) for p in noisy(100.0, 60)], start_ms=close_ms)
+    _, state = run(fn, close)
+    assert load_state(state)["cusum_n"] == 60
+    open_ms = close_ms + 60 * 1000 + int(17.5 * 3600 * 1000)
+    morning = make_ticks([(p, 100.0) for p in noisy(110.0, 5)], start_ms=open_ms)
+    out, state = run(fn, morning, state=state)
+    st = load_state(state)
+    assert st["cusum_n"] == 5
+    # the overnight jump never enters a CUSUM: the diff chain restarts at the open
+    assert st["cusum_up"] < 1.0 and st["cusum_down"] < 1.0
+    assert out["cusum_price"].isna().all()  # warming up again
+
+
+def test_wash_lookback_scales_to_the_tickers_trading_rate():
+    """With --wash-lookback-ticks, the lookback is K ticks' worth of the
+    ticker's typical spacing, not a fixed time: here 5 ticks at 1s apart =
+    5s, so a modest print is judged against the last few small trades
+    rather than a minute of earlier heavy volume."""
+    specs = [(100.0, 1000.0)] * 20 + [(100.0, 10.0)] * 5 + [(100.0, 30.0)]
+    # ratio pinned at 0.3: this tests the lookback, not the ratio default
+    fixed = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, wash_volume_ratio=0.3,
+        wash_lookback_ticks=0,
+    )
+    scaled = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, wash_volume_ratio=0.3,
+        wash_lookback_ticks=5,
+    )
+    out_fixed, _ = run(fixed, make_ticks(specs))
+    out_scaled, state = run(scaled, make_ticks(specs))
+    assert out_fixed.iloc[-1]["anomaly_type"] != "wash_trade"  # 30 vs 0.3 x ~20k trailing volume
+    assert out_scaled.iloc[-1]["anomaly_type"] == "wash_trade"  # 30 vs 0.3 x 50
+    assert abs(load_state(state)["rate_dt_ms"] - 1000.0) < 1e-6
+
+
+def test_gap_reset_also_resets_the_trading_rate():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    close_ms = 1_700_000_000_000
+    _, state = run(fn, make_ticks([(100.0, 100.0)] * 30, start_ms=close_ms, step_ms=2000))
+    assert load_state(state)["rate_n"] == 29
+    open_ms = close_ms + 60_000 + int(17.5 * 3600 * 1000)
+    _, state = run(fn, make_ticks([(100.0, 100.0)] * 3, start_ms=open_ms, step_ms=500), state=state)
+    st = load_state(state)
+    assert st["rate_n"] == 2
+    assert st["rate_dt_ms"] < 1000.0  # morning spacing only, no overnight gap
+
+
+# --- risk score and incidents
+
+
+def test_risk_score_is_the_largest_signal_over_its_alarm_level():
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    specs = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(40)] + [(500.0, 100.0)]
+    out, _ = run(fn, make_ticks(specs))
+    last = out.iloc[-1]
+    expected = max(abs(last["zscore"]) / 5.0, last["vwap_divergence"] / 0.01)
+    assert last["risk_score"] == pytest.approx(expected)
+    assert last["signals"] == "zscore,vwap"
+    unflagged = out.iloc[:-1]
+    assert (unflagged["risk_score"] <= 1.0).all()
+    assert unflagged["signals"].isna().all()
+
+
+def test_raising_risk_threshold_scales_every_signal_together():
+    specs = [(100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(40)] + [(100.45, 100.0)]
+    base = dict(window_size=20, min_samples=10, z_threshold=3.0, vwap_threshold=0.01)
+    at_1, _ = run(make_baseline_update_fn(**base), make_ticks(specs))
+    at_2, _ = run(make_baseline_update_fn(**base, risk_threshold=2.0), make_ticks(specs))
+    z = abs(at_1.iloc[-1]["zscore"])
+    assert 3.0 < z < 6.0  # over the z threshold, under twice it
+    assert at_1.iloc[-1]["is_anomaly"] and not at_2.iloc[-1]["is_anomaly"]
+    assert at_1.iloc[-1]["risk_score"] == pytest.approx(at_2.iloc[-1]["risk_score"])
+
+
+def incident_fn(**kw):
+    return make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=1e9, ewma_threshold=1e9,
+        cusum_h=1e9, cusum_volume_h=1e9, wash_volume_ratio=1e9, **kw,
+    )
+
+
+def spiky(n, spikes):
+    """Alternating +/-0.1 around 100 with isolated big spikes at `spikes`."""
+    return [(150.0 if i in spikes else 100.0 + (0.1 if i % 2 == 0 else -0.1), 100.0) for i in range(n)]
+
+
+def test_flags_within_the_gap_share_an_incident_and_a_longer_gap_starts_a_new_one():
+    out, _ = run(incident_fn(incident_gap_ticks=10), make_ticks(spiky(80, {30, 35, 60})))
+    flagged = out[out["is_anomaly"]]
+    assert list(flagged.index) == [30, 35, 60]
+    ids = flagged["incident_id"].tolist()
+    assert ids[0] == ids[1]  # 4 unflagged ticks apart
+    assert ids[2] != ids[0]  # 24 unflagged ticks apart
+    assert ids[0] == f"AAPL-{int(out.loc[30, 'timestamp'].value // 1_000_000)}"
+    assert out[~out["is_anomaly"]]["incident_id"].isna().all()
+
+
+def test_incident_continues_across_micro_batches():
+    ticks = make_ticks(spiky(80, {30, 35}))
+    out1, state = run(incident_fn(), ticks.iloc[:33])
+    out2, _ = run(incident_fn(), ticks.iloc[33:].reset_index(drop=True), state=state)
+    first = out1[out1["is_anomaly"]]["incident_id"].iloc[0]
+    assert out2[out2["is_anomaly"]]["incident_id"].tolist() == [first]
+
+
+def test_gap_reset_closes_the_open_incident():
+    close_ms = 1_700_000_000_000
+    close = make_ticks(spiky(35, {30}), start_ms=close_ms)
+    _, state = run(incident_fn(), close)
+    assert load_state(state)["incident_id"] is not None
+    open_ms = close_ms + 35_000 + int(17.5 * 3600 * 1000)
+    _, state = run(incident_fn(), make_ticks(spiky(3, set()), start_ms=open_ms), state=state)
+    assert load_state(state)["incident_id"] is None
+
+
+def test_tick_id_is_unique_and_stable_across_batches():
+    ticks = make_ticks([(100.0, 100.0)] * 6)
+    ticks.loc[3, "event_time_ms"] = ticks.loc[2, "event_time_ms"]  # two ticks in one millisecond
+    ticks.loc[4, "event_time_ms"] = ticks.loc[2, "event_time_ms"]
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    whole, _ = run(fn, ticks)
+    ms = int(ticks.loc[2, "event_time_ms"])
+    assert whole["tick_id"].tolist()[2:5] == [f"AAPL-{ms}-0", f"AAPL-{ms}-1", f"AAPL-{ms}-2"]
+    assert whole["tick_id"].is_unique
+    # split mid-millisecond: the sequence continues from state
+    first, state = run(fn, ticks.iloc[:4])
+    second, _ = run(fn, ticks.iloc[4:].reset_index(drop=True), state=state)
+    assert first["tick_id"].tolist() + second["tick_id"].tolist() == whole["tick_id"].tolist()
+
+
+def test_volume_spike_fires_on_a_large_print_after_warmup_even_if_price_moves():
+    fn = make_baseline_update_fn(
+        window_size=20, min_samples=10, z_threshold=1e9, vwap_threshold=1e9, ewma_threshold=1e9,
+        wash_volume_ratio=1e9, cusum_h=1e9, cusum_volume_h=1e9, volume_spike_multiple=6.0,
+    )
+    rng = np.random.default_rng(2)
+    calm = [(100.0 + (0.5 if i % 2 == 0 else -0.5), 100.0 * np.exp(rng.normal(0, 0.2))) for i in range(60)]
+    early = make_ticks([calm[0], (100.0, 5000.0)] + calm[1:])  # a big print during warm-up
+    out, _ = run(fn, early)
+    assert not out.iloc[1]["is_anomaly"]  # not scored yet
+    out, _ = run(fn, make_ticks(calm + [(100.5, 1000.0)]))  # ~10x typical, moving market
+    last = out.iloc[-1]
+    assert last["anomaly_type"] == "wash_trade"
+    assert last["signals"] == "volume_spike"
+    out, _ = run(fn, make_ticks(calm + [(100.5, 300.0)]))  # ~3x typical: under the 6x limit
+    assert not out.iloc[-1]["is_anomaly"]
+
+
+def test_zscore_is_insensitive_to_one_ulp_input_differences():
+    """The running-sum variance (sum_sq/n - mean^2) turned one-ulp changes in
+    input prices (a CSV write + re-read does this) into z-score differences
+    of ~1.5e-5 on this series; computed from the window directly they stay
+    around 1e-11."""
+    rng = np.random.default_rng(3)
+    prices = list(213.87 + np.cumsum(rng.normal(0, 0.005, 400)))
+    nudged = [np.nextafter(p, np.inf) if i % 7 == 0 else p for i, p in enumerate(prices)]
+    fn = make_baseline_update_fn(window_size=20, min_samples=10, z_threshold=5.0, vwap_threshold=0.01)
+    a, _ = run(fn, make_ticks([(p, 100.0) for p in prices]))
+    b, _ = run(fn, make_ticks([(p, 100.0) for p in nudged]))
+    za, zb = a["zscore"].astype(float).to_numpy()[100:], b["zscore"].astype(float).to_numpy()[100:]
+    assert np.nanmax(np.abs(za - zb)) < 1e-9
+
+
+def test_checkpoint_path_includes_state_layout_version():
+    path = checkpoint_path("./checkpoints/detect_anomalies/", "baseline")
+    assert path == f"./checkpoints/detect_anomalies/state-v{STATE_LAYOUT_VERSION}/baseline"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
