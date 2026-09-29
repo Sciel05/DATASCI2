@@ -10,6 +10,33 @@ import numpy as np
 
 from .alerting.config import CONFIG, AlertConfig
 
+
+ANOMALY_COLUMNS = [
+    "ticker",
+    "event_time",
+    "tick_id",
+    "price",
+    "volume",
+    "zscore",
+    "vwap_divergence",
+    "anomaly_type",
+    "ewma_divergence",
+    "cusum_price",
+    "cusum_volume",
+    "risk_score",
+    "signals",
+    "incident_id",
+]
+
+
+def _finite_float(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError):
+        return default
+
+
 class PersistenceClient(ABC):
     @abstractmethod
     def fetch_recent_anomalies(
@@ -55,7 +82,6 @@ class CassandraClient(PersistenceClient):
     def _connect(self):
         try:
             from cassandra.cluster import Cluster
-            from cassandra.query import PreparedStatement
 
             self._cluster = Cluster(
                 contact_points=[self.config.cassandra_host],
@@ -64,35 +90,33 @@ class CassandraClient(PersistenceClient):
             )
             self._session = self._cluster.connect(self.config.cassandra_keyspace)
 
-            # Check whether price and volume columns exist in the anomalies table
-            has_price_volume = False
+            # Select every refined field present in the live table. This keeps
+            # reads working during a rolling migration from the original
+            # five-column anomaly table.
+            legacy_columns = {
+                "ticker", "event_time", "zscore", "vwap_divergence", "anomaly_type"
+            }
+            available_columns = set(legacy_columns)
             try:
                 table_meta = self._cluster.metadata.keyspaces.get(self.config.cassandra_keyspace)
                 if table_meta and "anomalies" in table_meta.tables:
-                    cols = table_meta.tables["anomalies"].columns
-                    has_price_volume = "price" in cols and "volume" in cols
+                    available_columns = set(table_meta.tables["anomalies"].columns)
             except Exception:
-                has_price_volume = False
+                pass
 
             # Query is scoped to partition key (ticker) to avoid cluster-wide table scans
             # and avoid requiring ALLOW FILTERING in Cassandra.
-            if has_price_volume:
-                query = """
-                    SELECT ticker, event_time, price, volume, zscore, vwap_divergence, anomaly_type
-                    FROM anomalies
-                    WHERE ticker = ? AND event_time >= ?
-                    ORDER BY event_time DESC
-                    LIMIT ?
-                """
-            else:
-                query = """
-                    SELECT ticker, event_time, zscore, vwap_divergence, anomaly_type
-                    FROM anomalies
-                    WHERE ticker = ? AND event_time >= ?
-                    ORDER BY event_time DESC
-                    LIMIT ?
-                """
-            self._has_price_volume = has_price_volume
+            self._selected_anomaly_columns = [
+                name for name in ANOMALY_COLUMNS if name in available_columns
+            ]
+            selected = ", ".join(self._selected_anomaly_columns)
+            query = f"""
+                SELECT {selected}
+                FROM anomalies
+                WHERE ticker = ? AND event_time >= ?
+                ORDER BY event_time DESC
+                LIMIT ?
+            """
             self._prepared_stmt = self._session.prepare(query)
         except Exception as e:
             self._session = None
@@ -114,20 +138,35 @@ class CassandraClient(PersistenceClient):
         for sym in tickers_to_query:
             rows = self._session.execute(self._prepared_stmt, (sym, cutoff_time, limit))
             for row in rows:
+                zscore = _finite_float(getattr(row, "zscore", 0.0))
+                vwap_divergence = _finite_float(getattr(row, "vwap_divergence", 0.0))
+                risk_value = getattr(row, "risk_score", None)
+                # Legacy rows predate risk_score. Reconstruct the two original
+                # normalized detector signals so dashboard ranking remains useful.
+                risk_score = (
+                    _finite_float(risk_value)
+                    if risk_value is not None
+                    else max(abs(zscore) / 5.0, abs(vwap_divergence) / 0.01)
+                )
                 records.append({
                     "ticker": row.ticker,
                     "event_time": row.event_time,
-                    "price": float(getattr(row, "price", 0.0) or 0.0),
-                    "volume": float(getattr(row, "volume", 0.0) or 0.0),
-                    "zscore": float(row.zscore),
-                    "vwap_divergence": float(row.vwap_divergence),
+                    "tick_id": getattr(row, "tick_id", None),
+                    "price": _finite_float(getattr(row, "price", 0.0)),
+                    "volume": _finite_float(getattr(row, "volume", 0.0)),
+                    "zscore": zscore,
+                    "vwap_divergence": vwap_divergence,
                     "anomaly_type": str(row.anomaly_type),
+                    "ewma_divergence": _finite_float(getattr(row, "ewma_divergence", 0.0)),
+                    "cusum_price": _finite_float(getattr(row, "cusum_price", 0.0)),
+                    "cusum_volume": _finite_float(getattr(row, "cusum_volume", 0.0)),
+                    "risk_score": risk_score,
+                    "signals": getattr(row, "signals", None),
+                    "incident_id": getattr(row, "incident_id", None),
                 })
 
         if not records:
-            return pd.DataFrame(columns=[
-                "ticker", "event_time", "price", "volume", "zscore", "vwap_divergence", "anomaly_type"
-            ])
+            return pd.DataFrame(columns=ANOMALY_COLUMNS)
 
         df = pd.DataFrame(records)
         df["event_time"] = pd.to_datetime(df["event_time"], utc=True)
@@ -151,6 +190,8 @@ class CassandraClient(PersistenceClient):
                 "price_shocks": len(sym_df[sym_df["anomaly_type"] == "price_shock"]),
                 "wash_trades": len(sym_df[sym_df["anomaly_type"] == "wash_trade"]),
                 "max_zscore": float(sym_df["zscore"].abs().max()) if not sym_df.empty else 0.0,
+                "max_risk_score": float(sym_df["risk_score"].max()) if not sym_df.empty else 0.0,
+                "incident_count": int(sym_df["incident_id"].dropna().nunique()) if not sym_df.empty else 0,
                 "latest_event_time": sym_df["event_time"].max() if not sym_df.empty else None,
                 "latest_price": last_price,
                 "pct_change": pct_chg,
@@ -281,6 +322,23 @@ class MockReplayClient(PersistenceClient):
             anomalies["zscore"] = zscore.loc[anomalies.index]
             anomalies["vwap_divergence"] = vwap_div.loc[anomalies.index]
             anomalies["anomaly_type"] = anomalies["label"]
+            anomalies["ewma_divergence"] = 0.0
+            anomalies["cusum_price"] = 0.0
+            anomalies["cusum_volume"] = 0.0
+            anomalies["risk_score"] = np.maximum(
+                np.maximum(anomalies["zscore"].abs() / 5.0, anomalies["vwap_divergence"].abs() / 0.01),
+                1.01,
+            )
+            anomalies["signals"] = np.where(
+                anomalies["anomaly_type"] == "wash_trade", "wash_rule", "zscore"
+            )
+            event_ms = (anomalies.index.astype("int64") // 1_000_000).astype("int64")
+            anomalies["tick_id"] = [f"{sym}-{ms}-0" for ms in event_ms]
+            new_incident = (
+                anomalies.index.to_series().diff().dt.total_seconds().fillna(float("inf")) > 10.0
+            ) | anomalies["anomaly_type"].ne(anomalies["anomaly_type"].shift())
+            incident_starts = pd.Series(event_ms, index=anomalies.index).where(new_incident).ffill().astype("int64")
+            anomalies["incident_id"] = [f"{sym}-{ms}" for ms in incident_starts]
             processed.append(anomalies)
 
         df_anom = pd.concat(processed).reset_index()
@@ -362,7 +420,7 @@ class MockReplayClient(PersistenceClient):
         if ticker:
             filtered = filtered[filtered["ticker"] == ticker]
 
-        cols = ["ticker", "event_time", "price", "volume", "zscore", "vwap_divergence", "anomaly_type"]
+        cols = ANOMALY_COLUMNS
         res = filtered[cols].sort_values("event_time", ascending=False).head(limit).reset_index(drop=True)
         return res
 
@@ -384,6 +442,8 @@ class MockReplayClient(PersistenceClient):
                 "price_shocks": len(sym_df[sym_df["anomaly_type"] == "price_shock"]),
                 "wash_trades": len(sym_df[sym_df["anomaly_type"] == "wash_trade"]),
                 "max_zscore": float(sym_df["zscore"].abs().max()) if not sym_df.empty else 0.0,
+                "max_risk_score": float(sym_df["risk_score"].max()) if not sym_df.empty else 0.0,
+                "incident_count": int(sym_df["incident_id"].dropna().nunique()) if not sym_df.empty else 0,
                 "latest_event_time": sym_df["event_time"].max() if not sym_df.empty else None,
                 "latest_price": last_price,
                 "pct_change": pct_chg,

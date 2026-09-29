@@ -1,3 +1,5 @@
+import os
+import sys
 import time
 
 from pyspark.sql import SparkSession
@@ -7,7 +9,11 @@ from pyspark.sql.functions import (
     when,
 )
 
-from cassandra_sink import (
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from persistence.cassandra_sink import (
     write_anomalies_to_cassandra,
     write_raw_events_to_cassandra,
 )
@@ -16,7 +22,9 @@ from cassandra_sink import (
 spark = (
     SparkSession.builder
     .appName("StreamingPersistenceTest")
-    .master("local[*]")
+    .master("local[1]")
+    .config("spark.ui.enabled", "false")
+    .config("spark.sql.session.timeZone", "UTC")
     .getOrCreate()
 )
 
@@ -86,4 +94,4 @@ time.sleep(8)
 query.stop()
 spark.stop()
 
-print("\nStructured Streaming → Cassandra test completed.")
+print("\nStructured Streaming -> Cassandra test completed.")

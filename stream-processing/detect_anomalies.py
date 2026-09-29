@@ -82,6 +82,9 @@ Usage:
     # also mirror the output to a Kafka topic for persistence/ to consume:
     python detect_anomalies.py --output-topic market-anomalies
 
+    # or persist scored ticks and anomalies directly through Objective 3:
+    python detect_anomalies.py --cassandra-sink
+
 Run with spark-submit so the Kafka connector package resolves, e.g.:
     spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0 \
         detect_anomalies.py --starting-offsets earliest
@@ -91,6 +94,7 @@ import argparse
 import math
 import pickle
 import sys
+from pathlib import Path
 
 import pandas as pd
 from pyspark.sql import SparkSession, functions as F
@@ -693,12 +697,38 @@ def checkpoint_path(checkpoint_dir, name):
 
 
 def build_sink(anomaly_df, args, name):
-    """Wraps an {ticker, timestamp, price, volume, zscore, vwap_divergence,
-    is_anomaly, anomaly_type}-shaped stream in a console or Kafka sink. `name`
-    scopes the checkpoint directory under --checkpoint-dir.
+    """Wrap the refined detector stream in a console, Kafka, or Cassandra sink.
+
+    ``name`` scopes the checkpoint directory under ``--checkpoint-dir``.
     """
     checkpoint_dir = checkpoint_path(args.checkpoint_dir, name)
-    if args.output_topic:
+    if args.cassandra_sink and args.output_topic:
+        raise ValueError("--cassandra-sink and --output-topic are separate destinations; choose one")
+
+    if args.cassandra_sink:
+        persistence_dir = Path(__file__).resolve().parents[1] / "persistence"
+        sink_module = persistence_dir / "cassandra_sink.py"
+        # Ship the Python sink module to executors when this is submitted to a
+        # real Spark cluster; local shared filesystems must not be assumed.
+        anomaly_df.sparkSession.sparkContext.addPyFile(str(sink_module))
+        if str(persistence_dir) not in sys.path:
+            sys.path.insert(0, str(persistence_dir))
+        from cassandra_sink import (
+            write_anomalies_to_cassandra,
+            write_raw_events_to_cassandra,
+        )
+
+        def persist_batch(batch_df, batch_id):
+            # Both writes are idempotent because tick_id participates in each
+            # primary key. Spark can therefore retry a partially-written batch.
+            write_raw_events_to_cassandra(batch_df, batch_id)
+            write_anomalies_to_cassandra(batch_df, batch_id)
+
+        sink = (
+            anomaly_df.writeStream.foreachBatch(persist_batch)
+            .option("checkpointLocation", checkpoint_dir)
+        )
+    elif args.output_topic:
         sink = (
             anomaly_df.select(
                 F.col("ticker").alias("key"),
@@ -732,6 +762,11 @@ def parse_args(argv=None):
         "--output-topic",
         default=None,
         help="If set, mirror the anomaly stream to this Kafka topic instead of the console",
+    )
+    ap.add_argument(
+        "--cassandra-sink",
+        action="store_true",
+        help="Persist every scored tick plus flagged anomalies through persistence/cassandra_sink.py",
     )
     ap.add_argument(
         "--starting-offsets",
@@ -905,7 +940,12 @@ def parse_args(argv=None):
 
 def main():
     args = parse_args()
-    spark = SparkSession.builder.appName("market-surveillance-detect-anomalies").getOrCreate()
+    spark = (
+        SparkSession.builder
+        .appName("market-surveillance-detect-anomalies")
+        .config("spark.sql.session.timeZone", "UTC")
+        .getOrCreate()
+    )
     spark.sparkContext.setLogLevel("WARN")
 
     sinks = build_queries(spark, args)

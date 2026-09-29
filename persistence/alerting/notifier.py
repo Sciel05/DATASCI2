@@ -48,6 +48,7 @@ class Notifier:
         print(
             f"{color}[{alert.severity:<8}]{reset} "
             f"{alert.ticker:<5} | {alert.anomaly_type:<11} | "
+            f"Risk: {alert.peak_risk_score:5.2f} | "
             f"Z: {alert.peak_zscore:+5.2f} | "
             f"${alert.peak_price:7.2f} | "
             f"VWAP Div: {alert.peak_vwap_div * 100:4.2f}% | "
@@ -77,6 +78,8 @@ class Notifier:
                         {"name": "Type", "value": alert.anomaly_type, "inline": True},
                         {"name": "Price", "value": f"${alert.peak_price:.2f}", "inline": True},
                         {"name": "Peak Z-Score", "value": f"{alert.peak_zscore:+.2f}", "inline": True},
+                        {"name": "Peak Risk", "value": f"{alert.peak_risk_score:.2f}", "inline": True},
+                        {"name": "Signals", "value": alert.signals or "legacy", "inline": True},
                         {"name": "VWAP Divergence", "value": f"{alert.peak_vwap_div * 100:.2f}%", "inline": True},
                         {"name": "Tick Count", "value": str(alert.tick_count), "inline": True},
                         {"name": "Start Time (UTC)", "value": alert.start_time.strftime("%H:%M:%S"), "inline": True},

@@ -210,6 +210,15 @@ min_zscore = st.sidebar.slider(
     step=0.5,
 )
 
+min_risk_score = st.sidebar.slider(
+    "Min Risk Score",
+    min_value=0.0,
+    max_value=5.0,
+    value=0.0,
+    step=0.1,
+    help="Objective 2's strongest signal expressed as a multiple of its alarm threshold.",
+)
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("### THRESHOLD CALIBRATION")
 crit_z = st.sidebar.slider(
@@ -228,12 +237,30 @@ warn_z = st.sidebar.slider(
     step=0.25,
     help="Z-Score deviation that triggers WARNING severity.",
 )
+risk_critical = st.sidebar.slider(
+    "Critical Risk Score",
+    min_value=1.0,
+    max_value=5.0,
+    value=float(CONFIG.risk_score_critical),
+    step=0.1,
+    help="Normalized Objective 2 risk score that triggers CRITICAL severity.",
+)
+risk_warning = st.sidebar.slider(
+    "Warning Risk Score",
+    min_value=0.5,
+    max_value=2.0,
+    value=float(CONFIG.risk_score_warning),
+    step=0.1,
+    help="The refined detector flags rows above 1.0 by default.",
+)
 
 # Instantiate client and engine with calibrated thresholds
 cfg = AlertConfig(
     use_mock=not is_live,
     zscore_critical=crit_z,
     zscore_warning=warn_z,
+    risk_score_critical=risk_critical,
+    risk_score_warning=risk_warning,
 )
 try:
     client = get_persistence_client(config=cfg)
@@ -695,7 +722,9 @@ def render_surveillance_desk():
     # Apply severity classification
     if not df_anomalies.empty:
         df_anomalies["severity"] = df_anomalies.apply(
-            lambda r: engine.classify_severity(r["zscore"], r["vwap_divergence"], r["anomaly_type"]),
+            lambda r: engine.classify_severity(
+                r["zscore"], r["vwap_divergence"], r["anomaly_type"], r.get("risk_score", 0.0)
+            ),
             axis=1,
         )
         # Filter by user selections
@@ -705,6 +734,8 @@ def render_surveillance_desk():
             df_anomalies = df_anomalies[df_anomalies["severity"] == selected_severity]
         if min_zscore > 0.0:
             df_anomalies = df_anomalies[df_anomalies["zscore"].abs() >= min_zscore]
+        if min_risk_score > 0.0:
+            df_anomalies = df_anomalies[df_anomalies["risk_score"] >= min_risk_score]
 
     # Top KPI Cards
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
@@ -714,12 +745,13 @@ def render_surveillance_desk():
     price_shocks = len(df_anomalies[df_anomalies["anomaly_type"] == "price_shock"]) if not df_anomalies.empty else 0
     wash_trades = len(df_anomalies[df_anomalies["anomaly_type"] == "wash_trade"]) if not df_anomalies.empty else 0
     max_z = df_anomalies["zscore"].abs().max() if not df_anomalies.empty else 0.0
+    max_risk = df_anomalies["risk_score"].max() if not df_anomalies.empty else 0.0
 
     kpi1.metric("Total Anomaly Flags", f"{total_flags}")
     kpi2.metric("Critical Incidents", f"{critical_flags}")
     kpi3.metric("Price Shocks", f"{price_shocks}")
     kpi4.metric("Wash Trades", f"{wash_trades}")
-    kpi5.metric("Peak |Z-Score|", f"{max_z:.2f}")
+    kpi5.metric("Peak Risk Score", f"{max_risk:.2f}")
 
     # Active Alert Banner (Critical, Warning, or Normal status)
     if critical_flags > 0:
@@ -731,7 +763,7 @@ def render_surveillance_desk():
                 <strong>🔴 CRITICAL MARKET ALERT ({recent_crit['ticker']})</strong>: 
                 Severe <strong>{pattern_label}</strong> detected at <strong>${recent_crit['price']:.2f}</strong>. 
                 Price moved <strong>{abs(recent_crit['zscore']):.1f}x beyond normal boundaries</strong> at {recent_crit['event_time'].strftime('%H:%M:%S UTC')} 
-                <span style="font-size: 0.8rem; opacity: 0.85;">(Peak Z-Score: {recent_crit['zscore']:+.2f} · VWAP Divergence: {recent_crit['vwap_divergence'] * 100:.2f}%)</span>.
+                <span style="font-size: 0.8rem; opacity: 0.85;">(Risk: {recent_crit['risk_score']:.2f} · Signals: {recent_crit['signals'] or 'legacy'} · Peak Z-Score: {recent_crit['zscore']:+.2f} · VWAP Divergence: {recent_crit['vwap_divergence'] * 100:.2f}%)</span>.
             </div>
             """,
             unsafe_allow_html=True,
@@ -746,7 +778,7 @@ def render_surveillance_desk():
                 <strong>🟡 SURVEILLANCE WARNING ({recent_warn['ticker']})</strong>: 
                 <strong>{pattern_label}</strong> flagged at <strong>${recent_warn['price']:.2f}</strong>. 
                 {explanation} at {recent_warn['event_time'].strftime('%H:%M:%S UTC')} 
-                <span style="font-size: 0.8rem; opacity: 0.85;">(Z-Score: {recent_warn['zscore']:+.2f} · VWAP Divergence: {recent_warn['vwap_divergence'] * 100:.2f}%)</span>.
+                <span style="font-size: 0.8rem; opacity: 0.85;">(Risk: {recent_warn['risk_score']:.2f} · Signals: {recent_warn['signals'] or 'legacy'} · Z-Score: {recent_warn['zscore']:+.2f} · VWAP Divergence: {recent_warn['vwap_divergence'] * 100:.2f}%)</span>.
             </div>
             """,
             unsafe_allow_html=True,
@@ -771,12 +803,13 @@ def render_surveillance_desk():
         shocks = m.get("price_shocks", 0)
         washes = m.get("wash_trades", 0)
         peak_z = m.get("max_zscore", 0.0)
+        peak_risk = m.get("max_risk_score", 0.0)
         last_p = m.get("latest_price", 0.0)
         pct_chg = m.get("pct_change", 0.0)
 
-        if peak_z >= cfg.zscore_critical:
+        if peak_risk >= cfg.risk_score_critical or peak_z >= cfg.zscore_critical:
             status_label = "🔴 CRITICAL"
-        elif peak_z >= cfg.zscore_warning or washes > 0:
+        elif peak_risk >= cfg.risk_score_warning or peak_z >= cfg.zscore_warning or washes > 0:
             status_label = "🟡 WARNING"
         else:
             status_label = "🟢 NORMAL"
@@ -793,6 +826,7 @@ def render_surveillance_desk():
             "Total Anomalies": cnt,
             "Price Shocks": shocks,
             "Wash Trades": washes,
+            "Peak Risk": f"{peak_risk:.2f}",
             "Peak |Z-Score|": f"{peak_z:.2f}",
             "Latest Event": m.get("latest_event_time").strftime("%H:%M:%S") if m.get("latest_event_time") else "—",
         })
@@ -1046,15 +1080,19 @@ def render_surveillance_desk():
 
     if not df_anomalies.empty:
         display_df = df_anomalies.copy()
-        display_df["Case ID"] = [
-            f"INC-{abs(hash(str(t) + sym)) % 10000:04d}"
-            for t, sym in zip(display_df["event_time"], display_df["ticker"])
-        ]
+        display_df["Case ID"] = display_df.apply(
+            lambda r: r["incident_id"]
+            if r.get("incident_id")
+            else f"INC-{abs(hash(str(r['event_time']) + r['ticker'])) % 10000:04d}",
+            axis=1,
+        )
         display_df["Timestamp"] = display_df["event_time"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
         display_df["Price ($)"] = display_df["price"].apply(lambda p: f"${p:.2f}")
         display_df["Volume"] = display_df["volume"].apply(lambda v: f"{int(v):,}")
         display_df["Z-Score"] = display_df["zscore"].apply(lambda z: f"{z:+.2f}")
         display_df["VWAP Div (%)"] = display_df["vwap_divergence"].apply(lambda v: f"{v * 100:.2f}%")
+        display_df["Risk Score"] = display_df["risk_score"].apply(lambda v: f"{v:.2f}")
+        display_df["Signals"] = display_df["signals"].fillna("legacy")
 
         # Map to FINRA / SEC Regulatory Rule & Desk Status
         rule_map = {
@@ -1072,7 +1110,7 @@ def render_surveillance_desk():
 
         cols_order = [
             "Case ID", "Timestamp", "ticker", "Desk Status", "Regulatory Rule",
-            "Price ($)", "Volume", "Z-Score", "VWAP Div (%)"
+            "Price ($)", "Volume", "Risk Score", "Signals", "Z-Score", "VWAP Div (%)"
         ]
         st.dataframe(display_df[cols_order], use_container_width=True, hide_index=True)
 

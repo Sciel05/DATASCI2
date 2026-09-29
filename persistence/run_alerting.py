@@ -4,7 +4,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Set, Tuple
+from typing import Set
 
 # Add project root to sys.path so `persistence` package is importable
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -53,7 +53,7 @@ def main():
     engine = AlertEngine(config=config)
     notifier = Notifier(config=config)
 
-    seen_events: Set[Tuple[str, str]] = set()
+    seen_events: Set[str] = set()
     total_processed = 0
     total_alerts = 0
     last_heartbeat = time.time()
@@ -65,7 +65,13 @@ def main():
             new_events = []
 
             for _, row in df.iterrows():
-                event_key = (row["ticker"], str(row["event_time"]))
+                # Refined Objective 2 can emit more than one tick for the same
+                # ticker/millisecond. Its deterministic tick_id prevents both
+                # accidental drops here and duplicate alerts after retries.
+                event_key = row.get("tick_id")
+                if not event_key or str(event_key) == "nan":
+                    event_key = f"{row['ticker']}:{row['event_time']}"
+                event_key = str(event_key)
                 if event_key not in seen_events:
                     seen_events.add(event_key)
                     new_events.append(row.to_dict())

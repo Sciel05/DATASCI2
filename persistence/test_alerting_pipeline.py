@@ -21,6 +21,8 @@ class TestAlertingPipeline(unittest.TestCase):
             zscore_warning=3.0,
             vwap_critical=0.05,
             vwap_warning=0.025,
+            risk_score_critical=2.0,
+            risk_score_warning=1.0,
             burst_window_sec=5.0,
             cooldown_sec=15.0,
             alerts_log_path=os.path.join(os.path.dirname(__file__), "test_alerts.log"),
@@ -42,6 +44,8 @@ class TestAlertingPipeline(unittest.TestCase):
         self.assertEqual(self.engine.classify_severity(1.0, 0.03, "price_shock"), "WARNING")
         self.assertEqual(self.engine.classify_severity(1.0, 0.01, "wash_trade"), "WARNING")
         self.assertEqual(self.engine.classify_severity(1.0, 0.01, "normal"), "INFO")
+        self.assertEqual(self.engine.classify_severity(0.2, 0.001, "price_shock", 1.2), "WARNING")
+        self.assertEqual(self.engine.classify_severity(0.2, 0.001, "price_shock", 2.2), "CRITICAL")
 
     def test_burst_debouncing_and_escalation(self):
         now = datetime.now(timezone.utc)
@@ -135,6 +139,51 @@ class TestAlertingPipeline(unittest.TestCase):
         alert3 = self.engine.process_event(evt3)
         self.assertIsNotNone(alert3, "Events after cooldown expiry must trigger a new alert incident")
 
+    def test_refined_incident_identity_and_risk_metadata(self):
+        now = datetime.now(timezone.utc)
+        first = {
+            "ticker": "MSFT",
+            "anomaly_type": "price_shock",
+            "price": 420.0,
+            "volume": 1000.0,
+            "zscore": 1.0,
+            "vwap_divergence": 0.001,
+            "risk_score": 1.25,
+            "signals": "cusum_price",
+            "incident_id": "MSFT-1000",
+            "tick_id": "MSFT-1000-0",
+            "event_time": now,
+        }
+        alert = self.engine.process_event(first)
+        self.assertEqual(alert.severity, "WARNING")
+        self.assertEqual(alert.incident_id, "MSFT-1000")
+        self.assertEqual(alert.signals, "cusum_price")
+
+        # The detector's incident id remains authoritative even when two
+        # flags are farther apart than Kyle's original wall-clock window.
+        second = dict(first)
+        second.update({
+            "event_time": now + timedelta(seconds=8),
+            "risk_score": 2.4,
+            "signals": "ewma,cusum_price",
+            "tick_id": "MSFT-9000-0",
+        })
+        escalated = self.engine.process_event(second)
+        self.assertIsNotNone(escalated)
+        self.assertEqual(escalated.severity, "CRITICAL")
+        self.assertEqual(escalated.tick_count, 2)
+        self.assertEqual(escalated.peak_risk_score, 2.4)
+
+        # A new detector incident must not be suppressed by the old per-type
+        # cooldown because Objective 2 has already separated the incidents.
+        third = dict(first)
+        third.update({
+            "event_time": now + timedelta(seconds=9),
+            "incident_id": "MSFT-10000",
+            "tick_id": "MSFT-10000-0",
+        })
+        self.assertIsNotNone(self.engine.process_event(third))
+
     def test_mock_client_math_grounding(self):
         client = MockReplayClient(config=self.config)
         health = client.check_health()
@@ -143,7 +192,10 @@ class TestAlertingPipeline(unittest.TestCase):
 
         df = client.fetch_recent_anomalies(lookback_minutes=15, limit=50)
         self.assertFalse(df.empty)
-        self.assertTrue(set(["ticker", "event_time", "price", "volume", "zscore", "vwap_divergence", "anomaly_type"]).issubset(df.columns))
+        self.assertTrue(set([
+            "ticker", "event_time", "tick_id", "price", "volume", "zscore",
+            "vwap_divergence", "anomaly_type", "risk_score", "signals", "incident_id",
+        ]).issubset(df.columns))
 
     def test_notifier_audit_logging(self):
         alert = Alert(

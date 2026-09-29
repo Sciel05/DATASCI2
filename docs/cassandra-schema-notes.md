@@ -1,8 +1,7 @@
 # Cassandra schema notes for the stream-processing output
 
-For whoever builds the Cassandra table in `persistence/`. This note only
-describes what `stream-processing/detect_anomalies.py` writes; it doesn't
-change any Cassandra code.
+This contract is now implemented by `persistence/schema.cql`,
+`persistence/cassandra_sink.py`, and the risk-aware alerting/dashboard client.
 
 ## What arrives on the output topic
 

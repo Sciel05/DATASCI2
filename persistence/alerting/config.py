@@ -10,6 +10,11 @@ class AlertConfig:
     vwap_critical: float = 0.05
     vwap_warning: float = 0.025
 
+    # Objective 2 normalizes every detector signal by its own alarm level.
+    # A risk score above 1.0 is flagged; 2.0 is treated as critical.
+    risk_score_critical: float = 2.0
+    risk_score_warning: float = 1.0
+
     # Burst aggregation and cooldown intervals.
     # burst_window_sec groups rapid consecutive anomaly ticks on the same ticker into one incident.
     # cooldown_sec prevents repeated alerting for the same ticker after the incident subsides.

@@ -1,6 +1,6 @@
 # Persistence & Alerting (Objective 3)
 
-**Status: Persistence, Cassandra streaming sinks, Alerting engine, and Surveillance Dashboard implemented and verified.**
+**Status: Persistence, refined Objective 2 integration, alerting engine, and surveillance dashboard implemented and verified.**
 
 This module handles distributed persistence, real-time alert triage, and surveillance visualization for the Real-Time Market Surveillance Pipeline.
 
@@ -81,7 +81,7 @@ persistence/
 
 Tested across:
 - **Cassandra:** 4.1.12 (Docker)
-- **PySpark:** 3.5.9
+- **PySpark:** 4.2.0 for the refined detector (the sink is also regression-tested on 3.5.9)
 - **Java:** OpenJDK 17
 - **Python:** 3.10+ / 3.12
 - **Streamlit:** 1.42+
@@ -111,26 +111,37 @@ USE surveillance;
 CREATE TABLE IF NOT EXISTS raw_events (
     ticker text,
     event_time timestamp,
+    tick_id text,
     price double,
     volume double,
     side text,
-    PRIMARY KEY ((ticker), event_time)
-) WITH CLUSTERING ORDER BY (event_time DESC);
+    PRIMARY KEY ((ticker), event_time, tick_id)
+) WITH CLUSTERING ORDER BY (event_time DESC, tick_id ASC);
 
 -- Detected statistical anomalies
 CREATE TABLE IF NOT EXISTS anomalies (
     ticker text,
     event_time timestamp,
+    tick_id text,
     price double,
     volume double,
     zscore double,
     vwap_divergence double,
+    is_anomaly boolean,
     anomaly_type text,
-    PRIMARY KEY ((ticker), event_time)
-) WITH CLUSTERING ORDER BY (event_time DESC);
+    ewma_divergence double,
+    cusum_price double,
+    cusum_volume double,
+    risk_score double,
+    signals text,
+    incident_id text,
+    PRIMARY KEY ((ticker), event_time, tick_id)
+) WITH CLUSTERING ORDER BY (event_time DESC, tick_id ASC);
 ```
 
-Both tables use `ticker` as the partition key and `event_time DESC` as the clustering key, enabling $O(1)$ partition lookups ordered chronologically without requiring multi-partition full scans or `ALLOW FILTERING`.
+Both tables use `ticker` as the partition key and `(event_time, tick_id)` as clustering keys. The deterministic `tick_id` preserves distinct ticks in the same millisecond and makes Spark micro-batch retries idempotent. Queries remain partition-scoped and time ordered without `ALLOW FILTERING`.
+
+The primary key changed from the original schema. For an existing development database, export any data that must be retained, drop/recreate these two tables, and then reapply `schema.cql`; Cassandra cannot alter primary-key columns in place.
 
 ### 2. Initialize Cassandra in Docker
 
@@ -181,6 +192,16 @@ python persistence/run_alerting.py --interval 2.0 --lookback 10
 
 Alerts are formatted to `stdout` and appended as structured JSON-lines records to `persistence/alerts.log`.
 
+### 3. Refined detector directly to Cassandra
+
+From the project root, pass the explicit sink destination to Objective 2:
+
+```powershell
+python stream-processing/detect_anomalies.py --cassandra-sink
+```
+
+Every scored tick is stored in `raw_events`; rows with `is_anomaly = true` are also stored in `anomalies` with `risk_score`, `signals`, `incident_id`, and `tick_id`. The sink forces event-time conversion through UTC before handing timestamps to the Cassandra driver.
+
 ---
 
 ## Testing & Verification Suite
@@ -219,6 +240,12 @@ Alerts are formatted to `stdout` and appended as structured JSON-lines records t
    - `test_notifier_audit_logging`: Structured JSON record integrity and latency fields.
    - `test_severity_classification`: Threshold boundaries for CRITICAL, WARNING, and INFO tiers.
 
+5. **Objective 2 Contract Bridge:**
+   ```powershell
+   python -m unittest persistence.test_objective2_contract -v
+   ```
+   Validates both the original eight-field stream and the refined risk/incident fields through Spark sink normalization.
+
 ---
 
 ## Key Architecture & Design Highlights
@@ -226,7 +253,7 @@ Alerts are formatted to `stdout` and appended as structured JSON-lines records t
 1. **Partition-Scoped Cassandra Queries:**
    Instead of cluster-wide table scans (`SELECT * FROM anomalies WHERE event_time >= ? ALLOW FILTERING`), queries are strictly partitioned by ticker (`WHERE ticker = ? AND event_time >= ? LIMIT N`). This ensures constant $O(1)$ partition retrieval time even as the database scales to millions of records.
 2. **Burst Debouncing / Incident Aggregation:**
-   High-frequency streaming can flag dozens of consecutive ticks during a single price shock. The alerting engine aggregates anomalous ticks within a configurable time window (default 10s) into a unified incident, preserving peak metrics while preventing alert fatigue.
+   High-frequency streaming can flag dozens of consecutive ticks during a single price shock. Refined rows are grouped by Objective 2's stable `incident_id`; legacy rows retain Kyle's configurable time-window fallback. Peak risk and fired signals are preserved while preventing alert fatigue.
 3. **End-to-End Latency Tracking for Objective 4:**
    Every generated alert records `detection_latency_ms = (alert_created_at - anomaly_event_time)`, providing direct data points for median and p95 streaming latency evaluation.
 4. **Resilient Dual-Mode Client:**
