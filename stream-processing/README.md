@@ -638,6 +638,10 @@ demo alongside `data-ingestion/producer.py`.
 
 Pass `--output-topic market-anomalies` to mirror the anomaly stream to
 Kafka for `persistence/` to consume instead of printing to the console.
+Pass `--cassandra-sink` instead to use Objective 3's `foreachBatch`
+writers directly: all scored ticks go to `raw_events`, and flagged rows
+go to `anomalies` with the appended risk, signal, incident and tick
+identifiers. These two destination flags are mutually exclusive.
 See `python detect_anomalies.py --help` for all tunable
 thresholds/windows (baseline window size, Z-score/VWAP-divergence
 thresholds, EWMA and CUSUM settings, wash-trade lookback/volume-ratio/

@@ -1,9 +1,13 @@
+import os
 from cassandra.cluster import Cluster
 from datetime import datetime, timezone
 
 
 # Connect to Cassandra running in Docker
-cluster = Cluster(["127.0.0.1"], port=9042)
+cluster = Cluster(
+    [os.getenv("CASSANDRA_HOST", "127.0.0.1")],
+    port=int(os.getenv("CASSANDRA_PORT", "9042")),
+)
 
 # Connect directly to our project keyspace
 session = cluster.connect("surveillance")
@@ -18,11 +22,18 @@ insert_anomaly = session.prepare("""
     INSERT INTO anomalies (
         ticker,
         event_time,
+        tick_id,
+        price,
+        volume,
         zscore,
         vwap_divergence,
-        anomaly_type
+        is_anomaly,
+        anomaly_type,
+        risk_score,
+        signals,
+        incident_id
     )
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
 session.execute(
@@ -30,9 +41,16 @@ session.execute(
     (
         "AAPL",
         event_time,
+        f"AAPL-{int(event_time.timestamp() * 1000)}-0",
+        180.25,
+        5000.0,
         4.21,
         0.037,
-        "price_shock"
+        True,
+        "price_shock",
+        1.25,
+        "vwap",
+        f"AAPL-{int(event_time.timestamp() * 1000)}",
     )
 )
 

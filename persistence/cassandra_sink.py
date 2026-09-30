@@ -1,115 +1,170 @@
+"""Cassandra sinks for the Objective 2 Structured Streaming output.
+
+The refined detector appends risk and incident metadata to the original
+eight-field contract. These helpers accept both layouts so an older producer
+can still be drained while checkpoints and deployments are upgraded.
+"""
+
 import os
+from datetime import datetime, timezone
+from itertools import chain
+
+
+ANOMALY_COLUMNS = (
+    "ticker",
+    "event_time",
+    "tick_id",
+    "price",
+    "volume",
+    "zscore",
+    "vwap_divergence",
+    "is_anomaly",
+    "anomaly_type",
+    "ewma_divergence",
+    "cusum_price",
+    "cusum_volume",
+    "risk_score",
+    "signals",
+    "incident_id",
+)
+
+_OPTIONAL_TYPES = {
+    "zscore": "double",
+    "vwap_divergence": "double",
+    "anomaly_type": "string",
+    "ewma_divergence": "double",
+    "cusum_price": "double",
+    "cusum_volume": "double",
+    "risk_score": "double",
+    "signals": "string",
+    "incident_id": "string",
+    "tick_id": "string",
+}
+
+
+def prepare_detector_output(batch_df):
+    """Normalize either detector contract to the refined Cassandra shape."""
+    from pyspark.sql import functions as F
+
+    # Cassandra-driver receives Python ``datetime`` values from executors.
+    # Force Spark's conversion boundary to UTC so hosts in non-UTC zones do
+    # not silently shift the event-time clustering key.
+    batch_df.sparkSession.conf.set("spark.sql.session.timeZone", "UTC")
+    df = batch_df
+    if "timestamp" in df.columns:
+        df = df.withColumnRenamed("timestamp", "event_time")
+    elif "event_time" not in df.columns:
+        raise ValueError("Objective 2 output must contain timestamp or event_time")
+
+    for name, spark_type in _OPTIONAL_TYPES.items():
+        if name not in df.columns:
+            df = df.withColumn(name, F.lit(None).cast(spark_type))
+
+    # Old Objective 2 rows did not carry a stable identifier. Generate the
+    # same shape as the refined detector so the Cassandra primary key remains
+    # non-null during a rolling upgrade. Refined rows keep their supplied id.
+    event_time_ms = (F.col("event_time").cast("double") * F.lit(1000)).cast("long")
+    fallback_tick_id = F.concat_ws(
+        "-",
+        F.col("ticker"),
+        event_time_ms,
+        F.lit("0"),
+    )
+    return (
+        df.withColumn("_event_time_ms", event_time_ms)
+        .withColumn("tick_id", F.coalesce(F.col("tick_id"), fallback_tick_id))
+    )
+
+
+def _cassandra_values(row, columns):
+    """Build driver values without passing timezone-naive Spark datetimes."""
+    event_time = datetime.fromtimestamp(row["_event_time_ms"] / 1000.0, timezone.utc)
+    return tuple(event_time if name == "event_time" else row[name] for name in columns)
+
+
+def _connection_settings():
+    return (
+        os.getenv("CASSANDRA_HOST", "127.0.0.1"),
+        int(os.getenv("CASSANDRA_PORT", "9042")),
+        os.getenv("CASSANDRA_KEYSPACE", "surveillance"),
+    )
 
 
 def write_anomalies_to_cassandra(batch_df, batch_id):
-    """
-    Writes detected anomalies from a Spark micro-batch
-    into Cassandra's surveillance.anomalies table.
-    """
-
+    """Write flagged refined-detector rows to ``surveillance.anomalies``."""
     print(f"Processing anomaly batch {batch_id}")
 
     anomalies_df = (
-        batch_df
+        prepare_detector_output(batch_df)
         .filter("is_anomaly = true")
-        .withColumnRenamed("timestamp", "event_time")
-        .select(
-            "ticker",
-            "event_time",
-            "zscore",
-            "vwap_divergence",
-            "anomaly_type"
-        )
+        .select(*ANOMALY_COLUMNS, "_event_time_ms")
     )
 
     def write_partition(rows):
         from cassandra.cluster import Cluster
 
-        cassandra_host = os.getenv("CASSANDRA_HOST", "127.0.0.1")
+        rows = iter(rows)
+        try:
+            first_row = next(rows)
+        except StopIteration:
+            return
 
-        cluster = Cluster([cassandra_host], port=9042)
-        session = cluster.connect("surveillance")
-
-        insert_statement = session.prepare("""
-            INSERT INTO anomalies (
-                ticker,
-                event_time,
-                zscore,
-                vwap_divergence,
-                anomaly_type
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """)
-
-        for row in rows:
-            session.execute(
-                insert_statement,
-                (
-                    row.ticker,
-                    row.event_time,
-                    row.zscore,
-                    row.vwap_divergence,
-                    row.anomaly_type,
+        host, port, keyspace = _connection_settings()
+        cluster = Cluster([host], port=port)
+        try:
+            session = cluster.connect(keyspace)
+            insert_statement = session.prepare(
+                """
+                INSERT INTO anomalies (
+                    ticker, event_time, tick_id, price, volume,
+                    zscore, vwap_divergence, is_anomaly, anomaly_type,
+                    ewma_divergence, cusum_price, cusum_volume,
+                    risk_score, signals, incident_id
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
             )
 
-        cluster.shutdown()
+            for row in chain((first_row,), rows):
+                session.execute(insert_statement, _cassandra_values(row, ANOMALY_COLUMNS))
+        finally:
+            cluster.shutdown()
 
     anomalies_df.foreachPartition(write_partition)
-
     print(f"Batch {batch_id} written to Cassandra.")
 
 
 def write_raw_events_to_cassandra(batch_df, batch_id):
-    """
-    Writes all processed market events from a Spark micro-batch
-    into Cassandra's surveillance.raw_events table.
-    """
-
+    """Write every processed market event to ``surveillance.raw_events``."""
     print(f"Processing raw event batch {batch_id}")
 
-    raw_events_df = (
-        batch_df
-        .withColumnRenamed("timestamp", "event_time")
-        .select(
-            "ticker",
-            "event_time",
-            "price",
-            "volume"
-        )
-    )
+    raw_columns = ("ticker", "event_time", "tick_id", "price", "volume")
+    raw_events_df = prepare_detector_output(batch_df).select(*raw_columns, "_event_time_ms")
 
     def write_partition(rows):
         from cassandra.cluster import Cluster
 
-        cassandra_host = os.getenv("CASSANDRA_HOST", "127.0.0.1")
+        rows = iter(rows)
+        try:
+            first_row = next(rows)
+        except StopIteration:
+            return
 
-        cluster = Cluster([cassandra_host], port=9042)
-        session = cluster.connect("surveillance")
-
-        insert_statement = session.prepare("""
-            INSERT INTO raw_events (
-                ticker,
-                event_time,
-                price,
-                volume
-            )
-            VALUES (?, ?, ?, ?)
-        """)
-
-        for row in rows:
-            session.execute(
-                insert_statement,
-                (
-                    row.ticker,
-                    row.event_time,
-                    row.price,
-                    row.volume,
-                )
+        host, port, keyspace = _connection_settings()
+        cluster = Cluster([host], port=port)
+        try:
+            session = cluster.connect(keyspace)
+            insert_statement = session.prepare(
+                """
+                INSERT INTO raw_events (ticker, event_time, tick_id, price, volume)
+                VALUES (?, ?, ?, ?, ?)
+                """
             )
 
-        cluster.shutdown()
+            for row in chain((first_row,), rows):
+                session.execute(insert_statement, _cassandra_values(row, raw_columns))
+        finally:
+            cluster.shutdown()
 
     raw_events_df.foreachPartition(write_partition)
-
     print(f"Raw event batch {batch_id} written to Cassandra.")
