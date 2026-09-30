@@ -72,6 +72,11 @@ Confirms each ticker consistently maps to one partition and
 `event_time_ms` never goes backwards within a partition. Zero violations
 = Objective 1 is done.
 
+Each run reads the whole topic from the beginning and stops at its end
+(it commits no offsets, so re-running always re-checks everything), and
+exits 1 if it finds a violation. Add `--follow` to keep checking while
+`producer.py` is still sending; `--max-messages N` checks only the first N.
+
 ## Files
 
 | File | Purpose |
