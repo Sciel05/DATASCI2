@@ -27,7 +27,7 @@ class AlertConfig:
     cassandra_keyspace: str = "surveillance"
 
     # Runtime mode toggle. True uses mathematical replay from CSV; False connects to live Cassandra.
-    use_mock: bool = os.getenv("USE_MOCK", "True").lower() in ("true", "1")
+    use_mock: bool = os.getenv("USE_MOCK", "False").lower() in ("true", "1")
     mock_csv_path: str = os.path.join(
         os.path.dirname(__file__),
         "../../data-ingestion/aapl_msft_googl_tsla_nvda_ticks_labeled.csv"

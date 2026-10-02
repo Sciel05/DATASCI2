@@ -118,6 +118,8 @@ class CassandraClient(PersistenceClient):
                 LIMIT ?
             """
             self._prepared_stmt = self._session.prepare(query)
+            self._stmt_latest_anom = self._session.prepare("SELECT event_time FROM anomalies WHERE ticker = ? LIMIT 1")
+            self._stmt_latest_raw = self._session.prepare("SELECT event_time FROM raw_events WHERE ticker = ? LIMIT 1")
         except Exception as e:
             self._session = None
             raise ConnectionError(f"Failed to connect to Cassandra at {self.config.cassandra_host}:{self.config.cassandra_port}: {e}")
@@ -136,7 +138,14 @@ class CassandraClient(PersistenceClient):
 
         records = []
         for sym in tickers_to_query:
-            rows = self._session.execute(self._prepared_stmt, (sym, cutoff_time, limit))
+            rows = list(self._session.execute(self._prepared_stmt, (sym, cutoff_time, limit)))
+            if not rows and self._stmt_latest_anom:
+                latest_row = self._session.execute(self._stmt_latest_anom, (sym,)).one()
+                if latest_row and latest_row.event_time:
+                    latest_dt = latest_row.event_time if latest_row.event_time.tzinfo else latest_row.event_time.replace(tzinfo=timezone.utc)
+                    if latest_dt < cutoff_time:
+                        adjusted_cutoff = latest_dt - timedelta(minutes=lookback_minutes)
+                        rows = list(self._session.execute(self._prepared_stmt, (sym, adjusted_cutoff, limit)))
             for row in rows:
                 zscore = _finite_float(getattr(row, "zscore", 0.0))
                 vwap_divergence = _finite_float(getattr(row, "vwap_divergence", 0.0))
@@ -234,13 +243,21 @@ class CassandraClient(PersistenceClient):
             "SELECT event_time, price, volume FROM raw_events "
             "WHERE ticker = ? AND event_time >= ? ORDER BY event_time ASC"
         )
-        rows = self._session.execute(query, (ticker, cutoff_time))
+        rows = list(self._session.execute(query, (ticker, cutoff_time)))
+        if not rows and self._stmt_latest_raw:
+            latest_row = self._session.execute(self._stmt_latest_raw, (ticker,)).one()
+            if latest_row and latest_row.event_time:
+                latest_dt = latest_row.event_time if latest_row.event_time.tzinfo else latest_row.event_time.replace(tzinfo=timezone.utc)
+                if latest_dt < cutoff_time:
+                    adjusted_cutoff = latest_dt - timedelta(minutes=lookback_minutes)
+                    rows = list(self._session.execute(query, (ticker, adjusted_cutoff)))
+
         records = [
             {"event_time": row.event_time, "price": float(row.price), "volume": float(row.volume)}
             for row in rows
         ]
 
-        empty = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "zscore"])
+        empty = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "zscore", "vwap", "vwap_divergence"])
         if not records:
             return empty
 
@@ -251,15 +268,22 @@ class CassandraClient(PersistenceClient):
         ohlc = df["price"].resample("30s").ohlc().dropna()
         vol = df["volume"].resample("30s").sum().reindex(ohlc.index).fillna(0)
 
-        # Rolling z-score on 30s closes (window=15 candles, min_periods=5)
-        roll_mean = ohlc["close"].rolling(window=15, min_periods=5).mean()
-        roll_std = ohlc["close"].rolling(window=15, min_periods=5).std()
+        # Rolling z-score on 30s closes (window=15 candles, min_periods=2)
+        roll_mean = ohlc["close"].rolling(window=15, min_periods=2).mean()
+        roll_std = ohlc["close"].rolling(window=15, min_periods=2).std()
         # Guard against near-zero std causing z-score blowup:
         # suppress where std is below epsilon (price barely moving in window)
         eps = 1e-4
         std_safe = roll_std.where((roll_std >= eps) & (roll_std > 0), other=np.nan)
         zscore = ((ohlc["close"] - roll_mean) / std_safe).fillna(0.0).clip(-6.0, 6.0)
         zscore = zscore.where(roll_std >= eps, other=0.0).clip(-6.0, 6.0)
+
+        # Cumulative VWAP and divergence (%) for the lookback window
+        typical_price = (ohlc["high"] + ohlc["low"] + ohlc["close"]) / 3.0
+        cum_tp_vol = (typical_price * vol).cumsum()
+        cum_vol = vol.cumsum().replace(0, np.nan)
+        vwap = (cum_tp_vol / cum_vol).fillna(ohlc["close"])
+        vwap_divergence = ((ohlc["close"] - vwap) / vwap * 100).fillna(0.0).clip(-10.0, 10.0)
 
         result = pd.DataFrame({
             "time": ohlc.index,
@@ -269,8 +293,11 @@ class CassandraClient(PersistenceClient):
             "close": ohlc["close"].values,
             "volume": vol.values,
             "zscore": zscore.values,
+            "vwap": vwap.values,
+            "vwap_divergence": vwap_divergence.values,
         })
         return result.reset_index(drop=True)
+
 
 
 class MockReplayClient(PersistenceClient):
@@ -360,6 +387,13 @@ class MockReplayClient(PersistenceClient):
             zscore_ohlc = ((ohlc["close"] - roll_mean) / std_safe).fillna(0.0).clip(-6.0, 6.0)
             zscore_ohlc = zscore_ohlc.where(roll_std >= eps, other=0.0).clip(-6.0, 6.0)
 
+            # Cumulative VWAP and divergence (%) per ticker
+            typical_price = (ohlc["high"] + ohlc["low"] + ohlc["close"]) / 3.0
+            cum_tp_vol = (typical_price * vol).cumsum()
+            cum_vol = vol.cumsum().replace(0, np.nan)
+            vwap_ohlc = (cum_tp_vol / cum_vol).fillna(ohlc["close"])
+            vwap_div_ohlc = ((ohlc["close"] - vwap_ohlc) / vwap_ohlc * 100).fillna(0.0).clip(-10.0, 10.0)
+
             bar_df = pd.DataFrame({
                 "ticker": sym,
                 "dt": ohlc.index,
@@ -369,6 +403,8 @@ class MockReplayClient(PersistenceClient):
                 "close": ohlc["close"].values,
                 "volume": vol.values,
                 "zscore": zscore_ohlc.values,
+                "vwap": vwap_ohlc.values,
+                "vwap_divergence": vwap_div_ohlc.values,
             })
             ohlc_frames.append(bar_df)
 
@@ -473,7 +509,7 @@ class MockReplayClient(PersistenceClient):
         ].copy()
 
         if sub.empty:
-            return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "zscore"])
+            return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "zscore", "vwap", "vwap_divergence"])
 
         # Re-anchor bar timestamps to current UTC time (same logic as anomalies)
         sub["time"] = sub["relative_offset"].apply(
@@ -484,17 +520,29 @@ class MockReplayClient(PersistenceClient):
         cutoff = now_utc - timedelta(minutes=lookback_minutes)
         sub = sub[sub["time"] >= cutoff]
 
-        cols = ["time", "open", "high", "low", "close", "volume", "zscore"]
+        cols = ["time", "open", "high", "low", "close", "volume", "zscore", "vwap", "vwap_divergence"]
         return sub[cols].sort_values("time").reset_index(drop=True)
 
 
+_CLIENT_SINGLETONS = {}
+
+
 def get_persistence_client(config: AlertConfig = CONFIG) -> PersistenceClient:
-    """Factory function returning the configured persistence client."""
+    """Factory function returning the configured persistence client (cached singleton to prevent socket exhaustion)."""
+    key = (config.use_mock, config.cassandra_host, config.cassandra_port, config.cassandra_keyspace)
+    cached = _CLIENT_SINGLETONS.get(key)
+    if cached is not None:
+        return cached
+
     if config.use_mock:
-        return MockReplayClient(config=config)
-    try:
-        return CassandraClient(config=config)
-    except Exception as err:
-        # Fall back to mock client if Cassandra connection fails during development
-        print(f"Warning: Cassandra unavailable ({err}). Falling back to MockReplayClient.")
-        return MockReplayClient(config=config)
+        client = MockReplayClient(config=config)
+    else:
+        try:
+            client = CassandraClient(config=config)
+        except Exception as err:
+            # Fall back to mock client if Cassandra connection fails during development
+            print(f"Warning: Cassandra unavailable ({err}). Falling back to MockReplayClient.")
+            client = MockReplayClient(config=config)
+
+    _CLIENT_SINGLETONS[key] = client
+    return client

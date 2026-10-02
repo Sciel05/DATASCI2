@@ -1,6 +1,33 @@
 # Persistence & Alerting (Objective 3)
 
-**Status: Persistence, refined Objective 2 integration, alerting engine, and surveillance dashboard implemented and verified.**
+**Owners:** Villanueva, Hector Angelo & Gomugda, Kyle Joniel  
+**Last Updated:** 2026-10-02 20:34:00 +08:00  
+**Status:** Persistence, refined Objective 2 integration, alerting engine, connection-pooled client, and synchronized multi-pane surveillance dashboard implemented and verified.
+
+---
+
+## Recent Updates (October 2, 2026)
+
+**Update Timestamp:** `2026-10-02 20:34:00 +08:00`  
+**Focus:** Objective 3 Live Dashboard Upgrade, VWAP Analytics, & Cassandra Connection Stability
+
+### Key Additions & Improvements:
+1. **Synchronized 3-Pane TradingView Lightweight Charts:**
+   - Added [`tradingview_component.py`](file:///c:/Users/user/Downloads/DATASCI2/persistence/dashboard/tradingview_component.py) and local chart server [`chart_server.py`](file:///c:/Users/user/Downloads/DATASCI2/persistence/dashboard/chart_server.py) with bundled [`lightweight-charts.js`](file:///c:/Users/user/Downloads/DATASCI2/persistence/dashboard/lightweight-charts.js).
+   - Renders synchronized Candlesticks + VWAP, Volume histogram, rolling Z-score oscillator, and VWAP Divergence % panes.
+2. **Classic Plotly VWAP Divergence & VWAP Price Overlay:**
+   - Upgraded native Plotly charts in [`app.py`](file:///c:/Users/user/Downloads/DATASCI2/persistence/dashboard/app.py) to a 4-pane co-plot layout.
+   - Added rolling VWAP price curve directly onto the price chart, plus a dedicated VWAP Divergence subplot.
+3. **Live Candle Countdown Timer & Ingestion Telemetry:**
+   - Added a real-time countdown badge ("Next candle in Xs") showing exact seconds remaining in the active 30s candle period.
+   - Added live Cassandra data age calculation, active ticker counter, and anomaly detection stats.
+4. **Cassandra Connection Pooling Singleton:**
+   - Refactored [`persistence_client.py`](file:///c:/Users/user/Downloads/DATASCI2/persistence/persistence_client.py) to use thread-safe client singletons (`_CLIENT_SINGLETONS`).
+   - Completely resolved Cassandra driver socket exhaustion (`Too many open files`) during high-frequency auto-refreshes.
+5. **Continuous Live Streaming Replay:**
+   - Added `--live` and `--loop` flags to [`producer.py`](file:///c:/Users/user/Downloads/DATASCI2/data-ingestion/producer.py) to anchor tick timestamps to real-time wall clock during live demonstrations.
+
+---
 
 This module handles distributed persistence, real-time alert triage, and surveillance visualization for the Real-Time Market Surveillance Pipeline.
 
@@ -72,7 +99,10 @@ persistence/
 │   └── notifier.py                # Stdout formatting, JSON-lines log, Discord/Slack webhooks
 └── dashboard/                     # Financial surveillance desk
     ├── __init__.py
-    └── app.py                     # Streamlit application (dark terminal theme, Plotly co-plots)
+    ├── app.py                     # Streamlit application (dark terminal theme, Plotly & TradingView co-plots)
+    ├── tradingview_component.py   # Synchronized 3-pane candlestick & indicator embedder
+    ├── chart_server.py            # Local HTTP server for TradingView frontend
+    └── lightweight-charts.js      # Bundled TradingView Lightweight Charts library
 ```
 
 ---
@@ -258,3 +288,7 @@ Every scored tick is stored in `raw_events`; rows with `is_anomaly = true` are a
    Every generated alert records `detection_latency_ms = (alert_created_at - anomaly_event_time)`, providing direct data points for median and p95 streaming latency evaluation.
 4. **Resilient Dual-Mode Client:**
    `PersistenceClient` dynamically inspects Cassandra schema metadata to adapt query fields gracefully, while providing automatic in-process mock replay fallback for zero-dependency local runs.
+5. **Cassandra Connection Pooling via Client Singletons:**
+   Active Cassandra driver cluster sessions are managed in a thread-safe singleton cache (`_CLIENT_SINGLETONS`). This prevents driver connection leaks and socket/file-descriptor exhaustion (`Too many open files`) during high-frequency UI auto-refreshes.
+6. **Synchronized Technical & Statistical Co-Plots:**
+   Integrates hardware-accelerated TradingView Lightweight Charts alongside native Plotly subplots, providing synchronized Candlestick price action with rolling VWAP overlay, Volume histogram, rolling Z-score oscillator, and VWAP Divergence % with live candle countdown telemetry.
