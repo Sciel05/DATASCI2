@@ -52,14 +52,18 @@ def main():
     ap.add_argument("--topic", default="market-ticks")
     ap.add_argument("--bootstrap-servers", default="localhost:9092")
     ap.add_argument("--speed", type=float, default=50.0,
-                     help="Replay speed multiplier (ignored with --max-rate)")
+                    help="Replay speed multiplier (ignored with --max-rate)")
     ap.add_argument("--max-rate", action="store_true",
-                     help="Ignore timestamp pacing; send as fast as possible")
-    ap.add_argument("--max-gap-sec", type=float, default=None,
-                     help="Cap the simulated pause for any single gap "
-                          "(e.g. overnight/weekend) to this many real seconds")
+                    help="Ignore timestamp pacing; send as fast as possible")
+    ap.add_argument("--max-gap-sec", type=float, default=2.0,
+                    help="Cap simulated pause for any single gap "
+                         "(e.g. overnight/weekend) to this many real seconds (default: 2.0)")
     ap.add_argument("--report-every", type=int, default=500,
-                     help="Print a progress line every N messages")
+                    help="Print a progress line every N messages")
+    ap.add_argument("--loop", action="store_true",
+                    help="Continuously loop replay over the dataset")
+    ap.add_argument("--live", action="store_true",
+                    help="Anchor timestamps to current wall-clock time for real-time live pipeline/dashboard")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv).sort_values("event_time_ms").reset_index(drop=True)
@@ -71,9 +75,9 @@ def main():
         df["side"] = price_diff.apply(lambda d: "buy" if d >= 0 else "sell")
 
     passthrough_cols = [c for c in ("bid", "ask", "label") if c in df.columns]
-    print(f"Loaded {len(df)} events from {args.csv}")
+    print(f"Loaded {len(df)} events from {args.csv}", flush=True)
     if passthrough_cols:
-        print(f"  Passing through extra columns: {passthrough_cols}")
+        print(f"  Passing through extra columns: {passthrough_cols}", flush=True)
 
     conf = {
         "bootstrap.servers": args.bootstrap_servers,
@@ -82,57 +86,70 @@ def main():
     }
     producer = Producer(conf)
 
-    start_wall = time.time()
-    first_event_ms = df["event_time_ms"].iloc[0]
     sent = 0
+    iteration = 0
 
-    prev_event_ms = first_event_ms
-    time_debt_ms = 0.0  # accumulated real-time gap removed by --max-gap-sec
+    while True:
+        iteration += 1
+        if args.loop and iteration > 1:
+            print(f"--- Restarting dataset loop (iteration {iteration}) ---", flush=True)
 
-    for _, row in df.iterrows():
-        if not args.max_rate:
-            if args.max_gap_sec is not None:
-                gap_ms = row["event_time_ms"] - prev_event_ms
-                allowed_ms = args.max_gap_sec * 1000 * args.speed
-                if gap_ms > allowed_ms:
-                    time_debt_ms += gap_ms - allowed_ms
-                prev_event_ms = row["event_time_ms"]
+        start_wall = time.time()
+        first_event_ms = df["event_time_ms"].iloc[0]
+        prev_event_ms = first_event_ms
+        time_debt_ms = 0.0  # accumulated real-time gap removed by --max-gap-sec
 
-            target_elapsed = (row["event_time_ms"] - first_event_ms - time_debt_ms) / 1000.0 / args.speed
-            actual_elapsed = time.time() - start_wall
-            sleep_for = target_elapsed - actual_elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+        for _, row in df.iterrows():
+            if not args.max_rate:
+                if args.max_gap_sec is not None:
+                    gap_ms = row["event_time_ms"] - prev_event_ms
+                    allowed_ms = args.max_gap_sec * 1000 * args.speed
+                    if gap_ms > allowed_ms:
+                        time_debt_ms += gap_ms - allowed_ms
+                    prev_event_ms = row["event_time_ms"]
 
-        payload = {
-            "ticker": row["ticker"],
-            "event_time_ms": int(row["event_time_ms"]),
-            "price": float(row["price"]),
-            "volume": float(row["volume"]),
-            "side": row["side"],
-        }
-        for col in passthrough_cols:
-            payload[col] = row[col] if not pd.isna(row[col]) else None
-        # Key by ticker -> Kafka hashes to the same partition every time,
-        # guaranteeing per-asset ordering. This is Objective 1's core requirement.
-        producer.produce(
-            args.topic,
-            key=str(row["ticker"]).encode("utf-8"),
-            value=json.dumps(payload).encode("utf-8"),
-            callback=delivery_report,
-        )
-        producer.poll(0)  # trigger delivery callbacks without blocking
-        sent += 1
+                target_elapsed = (row["event_time_ms"] - first_event_ms - time_debt_ms) / 1000.0 / args.speed
+                actual_elapsed = time.time() - start_wall
+                sleep_for = target_elapsed - actual_elapsed
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
 
-        if sent % args.report_every == 0:
-            elapsed = time.time() - start_wall
-            rate = sent / elapsed if elapsed > 0 else 0
-            print(f"  sent {sent}/{len(df)}  ({rate:.1f} msgs/sec avg)")
+            # In live mode, stamp with current wall-clock time so timestamps align with real-time lookback
+            event_ts_ms = int(time.time() * 1000) if args.live else int(row["event_time_ms"])
 
-    producer.flush(timeout=30)
+            payload = {
+                "ticker": row["ticker"],
+                "event_time_ms": event_ts_ms,
+                "price": float(row["price"]),
+                "volume": float(row["volume"]),
+                "side": row["side"],
+            }
+            for col in passthrough_cols:
+                payload[col] = row[col] if not pd.isna(row[col]) else None
+            # Key by ticker -> Kafka hashes to the same partition every time,
+            # guaranteeing per-asset ordering. This is Objective 1's core requirement.
+            producer.produce(
+                args.topic,
+                key=str(row["ticker"]).encode("utf-8"),
+                value=json.dumps(payload).encode("utf-8"),
+                callback=delivery_report,
+            )
+            producer.poll(0)  # trigger delivery callbacks without blocking
+            sent += 1
+
+            if sent % args.report_every == 0:
+                elapsed = time.time() - start_wall
+                rate = sent / elapsed if elapsed > 0 else 0
+                loop_info = f" [loop {iteration}]" if args.loop else ""
+                print(f"  sent {sent}/{len(df)}{loop_info}  ({rate:.1f} msgs/sec avg)", flush=True)
+
+        producer.flush(timeout=10)
+        if not args.loop:
+            break
+
     total_elapsed = time.time() - start_wall
     print(f"Done. Sent {sent} messages in {total_elapsed:.1f}s "
-          f"({sent / total_elapsed:.1f} msgs/sec avg).")
+          f"({sent / total_elapsed:.1f} msgs/sec avg).", flush=True)
 
 
 if __name__ == "__main__":

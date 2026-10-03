@@ -14,7 +14,7 @@ Pelayo, Agatha Fei · Narciso, Frank Exequiel · Gomugda, Kyle Joniel
 |---|---|---|---|
 | 1 | Event Ingestion & Partitioning | Pelayo, Agatha Fei | Done — see `data-ingestion/` |
 | 2 | Real-Time Stream Processing & Detection | Narciso, Frank Exequiel | Refined detector implemented — see `stream-processing/` |
-| 3 | Distributed Persistence & Alerting | Villanueva, Hector Angelo & Gomugda, Kyle Joniel | Integrated and verified — see `persistence/` |
+| 3 | Distributed Persistence & Alerting | Villanueva, Hector Angelo & Gomugda, Kyle Joniel | Synchronized dashboard & persistence verified — see `persistence/` |
 | 4 | Pipeline Integration & Evaluation | Catacutan, Elijah | Objective 2/3 integration verified; evaluation pending — see `evaluation/` |
 
 ## Repo structure
