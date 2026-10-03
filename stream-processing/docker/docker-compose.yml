@@ -15,13 +15,68 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
+  cassandra:
+    image: cassandra:4.1
+    environment:
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 100M
+    ports:
+      - "9043:9042"   # host 9043, so a separate Cassandra can keep 9042
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "DESCRIBE KEYSPACES"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  # One-shot: applies persistence/schema.cql once Cassandra accepts queries,
+  # then exits. Idempotent (CREATE ... IF NOT EXISTS).
+  cassandra-init:
+    image: cassandra:4.1
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ../../persistence/schema.cql:/schema.cql:ro
+    entrypoint: ["cqlsh", "cassandra", "-f", "/schema.cql"]
+    restart: "no"
+
   pyspark:
     build: .
     depends_on:
       - kafka
+      - cassandra
+    environment:
+      CASSANDRA_HOST: cassandra
+      # a missing Cassandra fails the persistence tests here instead of skipping them
+      REQUIRE_CASSANDRA: "1"
+    ports:
+      - "8501:8501"   # Streamlit dashboard (persistence/dashboard/app.py)
     volumes:
       - ../..:/workspace
     working_dir: /workspace
     tty: true
     stdin_open: true
     command: sleep infinity
+
+  # Live dashboard (persistence/live_dashboard): its own container so it
+  # doesn't compete with the Spark job for CPU. http://localhost:8502
+  live-dashboard:
+    build: .
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    environment:
+      CASSANDRA_HOST: cassandra
+    ports:
+      - "8502:8502"
+    volumes:
+      - ../..:/workspace
+    working_dir: /workspace
+    command: python3 -u persistence/live_dashboard/server.py
+    restart: unless-stopped
+
+volumes:
+  cassandra-data:

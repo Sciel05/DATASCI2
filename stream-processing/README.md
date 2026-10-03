@@ -555,7 +555,11 @@ restriction), so `apt`/pip installs failed; Docker Desktop's network
 worked fine.
 
 Container names come from the compose project (the `docker/`
-directory name): `docker-kafka-1`, `docker-pyspark-1`.
+directory name): `docker-kafka-1`, `docker-pyspark-1`, `docker-cassandra-1`.
+The stack also runs Cassandra 4.1 for `persistence/` (host port 9043,
+`cassandra:9042` inside the network; `cassandra-init` applies
+`persistence/schema.cql` once it is healthy) and publishes port 8501 for
+the Streamlit dashboard. See `persistence/README.md`.
 
 ### Parity check (streaming vs offline)
 
