@@ -1,124 +1,61 @@
-import os
-import sys
+"""Spark batch -> Cassandra through the sink functions the detector uses."""
+
 from datetime import datetime, timezone
-
-from pyspark.sql import SparkSession
-
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 from persistence.cassandra_sink import (
     write_anomalies_to_cassandra,
     write_raw_events_to_cassandra,
 )
-spark = (
-    SparkSession.builder
-    .appName("PersistenceSinkTest")
-    .master("local[1]")
-    .config("spark.ui.enabled", "false")
-    .config("spark.sql.session.timeZone", "UTC")
-    .config("spark.cassandra.connection.host", "127.0.0.1")
-    .config("spark.cassandra.connection.port", "9042")
-    .getOrCreate()
-)
 
-
-event_time = datetime.now(timezone.utc)
-
-test_data = [
-    (
-        "AAPL",
-        event_time,
-        251.50,
-        500.0,
-        4.21,
-        0.037,
-        True,
-        "price_shock",
-        2.8,
-        6.2,
-        0.0,
-        1.35,
-        "vwap,cusum_price",
-        f"AAPL-{int(event_time.timestamp() * 1000)}",
-        f"AAPL-{int(event_time.timestamp() * 1000)}-0",
-    ),
-    (
-        "MSFT",
-        event_time,
-        420.10,
-        200.0,
-        1.20,
-        0.005,
-        False,
-        "normal",
-        0.2,
-        0.0,
-        0.0,
-        0.24,
-        None,
-        None,
-        f"MSFT-{int(event_time.timestamp() * 1000)}-0",
-    ),
+COLUMNS = [
+    "ticker", "timestamp", "price", "volume", "zscore", "vwap_divergence",
+    "is_anomaly", "anomaly_type", "ewma_divergence", "cusum_price",
+    "cusum_volume", "risk_score", "signals", "incident_id", "tick_id",
 ]
 
-
-columns = [
-    "ticker",
-    "timestamp",
-    "price",
-    "volume",
-    "zscore",
-    "vwap_divergence",
-    "is_anomaly",
-    "anomaly_type",
-    "ewma_divergence",
-    "cusum_price",
-    "cusum_volume",
-    "risk_score",
-    "signals",
-    "incident_id",
-    "tick_id",
-]
+EVENT_TIME = datetime(2026, 9, 16, 14, 30, 0, 250000, tzinfo=timezone.utc)
+MS = int(EVENT_TIME.timestamp() * 1000)
 
 
-batch_df = spark.createDataFrame(test_data, columns)
+def detector_rows():
+    return [
+        ("PYTEST_B1", EVENT_TIME, 251.50, 500.0, 4.21, 0.037, True, "price_shock",
+         2.8, 6.2, 0.0, 1.35, "vwap,cusum_price", f"PYTEST_B1-{MS}", f"PYTEST_B1-{MS}-0"),
+        ("PYTEST_B2", EVENT_TIME, 420.10, 200.0, 1.20, 0.005, False, None,
+         0.2, 0.0, 0.0, 0.24, None, None, f"PYTEST_B2-{MS}-0"),
+    ]
 
-print("\nFake Task 2 output:")
-batch_df.show(truncate=False)
 
-write_anomalies_to_cassandra(batch_df, 1)
-write_raw_events_to_cassandra(batch_df, 1)
+def select(session, table, ticker):
+    return list(session.execute(f"SELECT * FROM {table} WHERE ticker = %s", (ticker,)))
 
-# Verify the appended Objective 2 fields made it through Spark and Cassandra.
-from cassandra.cluster import Cluster
 
-cluster = Cluster(
-    [os.getenv("CASSANDRA_HOST", "127.0.0.1")],
-    port=int(os.getenv("CASSANDRA_PORT", "9042")),
-)
-try:
-    session = cluster.connect("surveillance")
-    stored_event_time = event_time.replace(
-        microsecond=(event_time.microsecond // 1000) * 1000
-    )
-    stored = session.execute(
-        "SELECT risk_score, signals, incident_id FROM anomalies "
-        "WHERE ticker = %s AND event_time = %s AND tick_id = %s",
-        (
-            "AAPL",
-            stored_event_time,
-            f"AAPL-{int(event_time.timestamp() * 1000)}-0",
-        ),
-    ).one()
-    assert stored is not None
-    assert stored.risk_score == 1.35
-    assert stored.signals == "vwap,cusum_price"
-    assert stored.incident_id == f"AAPL-{int(event_time.timestamp() * 1000)}"
-finally:
-    cluster.shutdown()
+def test_batch_writes_all_ticks_and_only_flagged_anomalies(spark, cassandra_session):
+    batch_df = spark.createDataFrame(detector_rows(), COLUMNS)
 
-print("\nSpark -> Cassandra test completed.")
+    # Written twice, as a retried micro-batch would be: tick_id is part of
+    # both primary keys, so the retry overwrites instead of duplicating.
+    for _ in range(2):
+        write_raw_events_to_cassandra(batch_df, 1)
+        write_anomalies_to_cassandra(batch_df, 1)
 
-spark.stop()
+    raw_b1 = select(cassandra_session, "raw_events", "PYTEST_B1")
+    raw_b2 = select(cassandra_session, "raw_events", "PYTEST_B2")
+    assert [(r.tick_id, r.price, r.volume) for r in raw_b1] == [(f"PYTEST_B1-{MS}-0", 251.50, 500.0)]
+    assert [(r.tick_id, r.price, r.volume) for r in raw_b2] == [(f"PYTEST_B2-{MS}-0", 420.10, 200.0)]
+    assert raw_b1[0].event_time == EVENT_TIME.replace(tzinfo=None)
+
+    anomalies = select(cassandra_session, "anomalies", "PYTEST_B1")
+    assert len(anomalies) == 1
+    a = anomalies[0]
+    assert a.event_time == EVENT_TIME.replace(tzinfo=None)
+    assert a.tick_id == f"PYTEST_B1-{MS}-0"
+    assert (a.price, a.volume, a.zscore, a.vwap_divergence) == (251.50, 500.0, 4.21, 0.037)
+    assert (a.ewma_divergence, a.cusum_price, a.cusum_volume, a.risk_score) == (2.8, 6.2, 0.0, 1.35)
+    assert a.is_anomaly is True
+    assert a.anomaly_type == "price_shock"
+    assert a.signals == "vwap,cusum_price"
+    assert a.incident_id == f"PYTEST_B1-{MS}"
+
+    # The unflagged tick is stored as a raw event only.
+    assert select(cassandra_session, "anomalies", "PYTEST_B2") == []

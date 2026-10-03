@@ -714,9 +714,20 @@ def build_sink(anomaly_df, args, name):
         if str(persistence_dir) not in sys.path:
             sys.path.insert(0, str(persistence_dir))
         from cassandra_sink import (
+            _connection_settings,
             write_anomalies_to_cassandra,
             write_raw_events_to_cassandra,
         )
+        from schema_tools import connect, verify_schema
+
+        # Fail before the query starts, not on the first batch's insert:
+        # schema.cql's IF NOT EXISTS keeps an older table layout in place.
+        host, port, keyspace = _connection_settings()
+        cluster, session = connect(host, port)
+        try:
+            verify_schema(session, keyspace)
+        finally:
+            cluster.shutdown()
 
         def persist_batch(batch_df, batch_id):
             # Both writes are idempotent because tick_id participates in each

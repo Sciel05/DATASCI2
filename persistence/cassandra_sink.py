@@ -6,6 +6,7 @@ can still be drained while checkpoints and deployments are upgraded.
 """
 
 import os
+import time
 from datetime import datetime, timezone
 from itertools import chain
 
@@ -82,6 +83,52 @@ def _cassandra_values(row, columns):
     return tuple(event_time if name == "event_time" else row[name] for name in columns)
 
 
+# Inserts in flight at once per partition, and the per-insert timeout. One
+# synchronous insert at a time timed out on a full day of ticks against a
+# single small Cassandra node; concurrent inserts with a longer timeout don't.
+WRITE_CONCURRENCY = int(os.getenv("CASSANDRA_WRITE_CONCURRENCY", "64"))
+WRITE_TIMEOUT_S = float(os.getenv("CASSANDRA_WRITE_TIMEOUT", "30"))
+
+
+def _execute_all(session, statement, params):
+    from cassandra.concurrent import execute_concurrent_with_args
+
+    session.default_timeout = WRITE_TIMEOUT_S
+    execute_concurrent_with_args(
+        session, statement, params, concurrency=WRITE_CONCURRENCY, raise_on_first_error=True
+    )
+
+
+# One session per Python worker process, reused across partitions and
+# micro-batches (Spark reuses its Python workers). Connecting per partition
+# meant a DNS lookup and a new connection pool thousands of times per run,
+# and a single failed lookup killed the streaming query.
+_SESSIONS = {}
+CONNECT_ATTEMPTS = 5
+
+
+def _session():
+    from cassandra.cluster import Cluster
+
+    key = _connection_settings()
+    session = _SESSIONS.get(key)
+    if session is not None and not session.is_shutdown:
+        return session
+    host, port, keyspace = key
+    for attempt in range(CONNECT_ATTEMPTS):
+        cluster = Cluster([host], port=port)
+        try:
+            session = cluster.connect(keyspace)
+            break
+        except Exception:
+            cluster.shutdown()
+            if attempt == CONNECT_ATTEMPTS - 1:
+                raise
+            time.sleep(2 ** attempt)  # 1, 2, 4, 8 s: rides out a brief DNS or network blip
+    _SESSIONS[key] = session
+    return session
+
+
 def _connection_settings():
     return (
         os.getenv("CASSANDRA_HOST", "127.0.0.1"),
@@ -101,34 +148,29 @@ def write_anomalies_to_cassandra(batch_df, batch_id):
     )
 
     def write_partition(rows):
-        from cassandra.cluster import Cluster
-
         rows = iter(rows)
         try:
             first_row = next(rows)
         except StopIteration:
             return
 
-        host, port, keyspace = _connection_settings()
-        cluster = Cluster([host], port=port)
-        try:
-            session = cluster.connect(keyspace)
-            insert_statement = session.prepare(
-                """
-                INSERT INTO anomalies (
-                    ticker, event_time, tick_id, price, volume,
-                    zscore, vwap_divergence, is_anomaly, anomaly_type,
-                    ewma_divergence, cusum_price, cusum_volume,
-                    risk_score, signals, incident_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """
+        session = _session()
+        insert_statement = session.prepare(
+            """
+            INSERT INTO anomalies (
+                ticker, event_time, tick_id, price, volume,
+                zscore, vwap_divergence, is_anomaly, anomaly_type,
+                ewma_divergence, cusum_price, cusum_volume,
+                risk_score, signals, incident_id
             )
-
-            for row in chain((first_row,), rows):
-                session.execute(insert_statement, _cassandra_values(row, ANOMALY_COLUMNS))
-        finally:
-            cluster.shutdown()
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+        )
+        _execute_all(
+            session,
+            insert_statement,
+            (_cassandra_values(row, ANOMALY_COLUMNS) for row in chain((first_row,), rows)),
+        )
 
     anomalies_df.foreachPartition(write_partition)
     print(f"Batch {batch_id} written to Cassandra.")
@@ -142,29 +184,24 @@ def write_raw_events_to_cassandra(batch_df, batch_id):
     raw_events_df = prepare_detector_output(batch_df).select(*raw_columns, "_event_time_ms")
 
     def write_partition(rows):
-        from cassandra.cluster import Cluster
-
         rows = iter(rows)
         try:
             first_row = next(rows)
         except StopIteration:
             return
 
-        host, port, keyspace = _connection_settings()
-        cluster = Cluster([host], port=port)
-        try:
-            session = cluster.connect(keyspace)
-            insert_statement = session.prepare(
-                """
-                INSERT INTO raw_events (ticker, event_time, tick_id, price, volume)
-                VALUES (?, ?, ?, ?, ?)
-                """
-            )
-
-            for row in chain((first_row,), rows):
-                session.execute(insert_statement, _cassandra_values(row, raw_columns))
-        finally:
-            cluster.shutdown()
+        session = _session()
+        insert_statement = session.prepare(
+            """
+            INSERT INTO raw_events (ticker, event_time, tick_id, price, volume)
+            VALUES (?, ?, ?, ?, ?)
+            """
+        )
+        _execute_all(
+            session,
+            insert_statement,
+            (_cassandra_values(row, raw_columns) for row in chain((first_row,), rows)),
+        )
 
     raw_events_df.foreachPartition(write_partition)
     print(f"Raw event batch {batch_id} written to Cassandra.")
