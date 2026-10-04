@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 
 from .alerting.config import CONFIG, AlertConfig
+from .schema_tools import cluster as make_cluster
 
 
 ANOMALY_COLUMNS = [
@@ -81,11 +82,10 @@ class CassandraClient(PersistenceClient):
 
     def _connect(self):
         try:
-            from cassandra.cluster import Cluster
-
-            self._cluster = Cluster(
-                contact_points=[self.config.cassandra_host],
-                port=self.config.cassandra_port,
+            # every contact point in CASSANDRA_HOST, reads at LOCAL_QUORUM
+            self._cluster = make_cluster(
+                self.config.cassandra_host,
+                self.config.cassandra_port,
                 connect_timeout=5.0,
             )
             self._session = self._cluster.connect(self.config.cassandra_keyspace)

@@ -131,8 +131,8 @@ python -m pip install -r persistence/requirements.txt
 ```sql
 CREATE KEYSPACE IF NOT EXISTS surveillance
 WITH replication = {
-    'class': 'SimpleStrategy',
-    'replication_factor': 1
+    'class': 'NetworkTopologyStrategy',
+    'datacenter1': 3
 } AND durable_writes = true;
 
 USE surveillance;
@@ -186,11 +186,16 @@ cd stream-processing/docker
 docker compose up -d --build
 ```
 
-The one-shot `cassandra-init` service applies `schema.cql` as soon as Cassandra is healthy. Cassandra listens on `localhost:9042` from the host and on `cassandra:9042` inside the stack (the `pyspark` container has `CASSANDRA_HOST=cassandra` set). Data survives restarts in the `cassandra-data` volume. Check the tables with:
+The stack runs a **3-node Cassandra cluster** (`cassandra1`, `cassandra2`, `cassandra3`, one datacenter). The nodes join one at a time, so the first start takes a few minutes. The keyspace keeps 3 replicas of every row, and every client (sink, dashboard, tests) reads and writes at `LOCAL_QUORUM` (2 of 3), so the pipeline keeps running with any one node down. The reasoning and the measured node-failure drill are in [`evaluation/README.md`](../evaluation/README.md).
+
+The one-shot `cassandra-init` service applies `schema.cql` once all three nodes are healthy. From the host, `cassandra1` is on `localhost:9043`. Inside the stack the `pyspark` container uses all three nodes as contact points (`CASSANDRA_HOST=cassandra1,cassandra2,cassandra3`, `CASSANDRA_CONSISTENCY=LOCAL_QUORUM`). Each node keeps its data in its own volume (`cassandra1-data` ...). Check the ring and the tables with:
 
 ```bash
-docker exec docker-cassandra-1 cqlsh -e "DESCRIBE KEYSPACE surveillance"
+docker compose exec cassandra1 nodetool status      # three UN (Up/Normal) lines
+docker compose exec cassandra1 cqlsh -e "DESCRIBE KEYSPACE surveillance"
 ```
+
+`CASSANDRA_HOST` accepts a comma-separated list everywhere. On a single local Cassandra, apply the schema with `python -m persistence.schema_tools`, not `cqlsh -f`: it lowers the replication factor to the number of nodes (a quorum of 3 replicas can't be met by one node).
 
 ---
 

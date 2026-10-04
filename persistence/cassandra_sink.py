@@ -93,7 +93,6 @@ WRITE_TIMEOUT_S = float(os.getenv("CASSANDRA_WRITE_TIMEOUT", "30"))
 def _execute_all(session, statement, params):
     from cassandra.concurrent import execute_concurrent_with_args
 
-    session.default_timeout = WRITE_TIMEOUT_S
     execute_concurrent_with_args(
         session, statement, params, concurrency=WRITE_CONCURRENCY, raise_on_first_error=True
     )
@@ -108,7 +107,12 @@ CONNECT_ATTEMPTS = 5
 
 
 def _session():
-    from cassandra.cluster import Cluster
+    # imported the way this module was: as persistence.cassandra_sink (tests)
+    # or as cassandra_sink with persistence/ on sys.path (detect_anomalies.py)
+    try:
+        from persistence.schema_tools import cluster as make_cluster
+    except ImportError:
+        from schema_tools import cluster as make_cluster
 
     key = _connection_settings()
     session = _SESSIONS.get(key)
@@ -116,12 +120,16 @@ def _session():
         return session
     host, port, keyspace = key
     for attempt in range(CONNECT_ATTEMPTS):
-        cluster = Cluster([host], port=port)
+        cluster = None
         try:
+            # every contact point, LOCAL_QUORUM. Inside the try: Cluster()
+            # resolves the host names itself and raises if none resolve.
+            cluster = make_cluster(host, port, request_timeout=WRITE_TIMEOUT_S)
             session = cluster.connect(keyspace)
             break
         except Exception:
-            cluster.shutdown()
+            if cluster is not None:
+                cluster.shutdown()
             if attempt == CONNECT_ATTEMPTS - 1:
                 raise
             time.sleep(2 ** attempt)  # 1, 2, 4, 8 s: rides out a brief DNS or network blip

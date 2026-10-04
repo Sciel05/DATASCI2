@@ -12,6 +12,15 @@ later on its first insert. ``verify_schema`` catches that up front, and
 Host, port and keyspace come from CASSANDRA_HOST / CASSANDRA_PORT /
 CASSANDRA_KEYSPACE (defaults 127.0.0.1 / 9042 / surveillance), or the
 matching flags. Run from the repository root.
+
+CASSANDRA_HOST may list several contact points, comma-separated
+("cassandra1,cassandra2,cassandra3" in the Docker stack), so a client can
+still connect while one node is down. Every session made by ``cluster()``
+reads and writes at CASSANDRA_CONSISTENCY (default LOCAL_QUORUM).
+
+schema.cql asks for 3 replicas; on a cluster with fewer nodes (a single
+local Cassandra) ``apply_schema`` creates the keyspace with as many
+replicas as there are nodes, since a quorum of 3 can't be met by 1 node.
 """
 
 import argparse
@@ -22,6 +31,7 @@ from pathlib import Path
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.cql"
 SCHEMA_KEYSPACE = "surveillance"
+REPLICATION_RE = re.compile(r"'(\w+)'\s*:\s*(\d+)\s*}")
 
 # Columns the sink writes to each table (cassandra_sink.py).
 REQUIRED_COLUMNS = {
@@ -46,10 +56,31 @@ def schema_statements(keyspace=SCHEMA_KEYSPACE):
     return [s.strip() for s in text.split(";") if s.strip()]
 
 
+def fit_replication(statement, hosts):
+    """Fit schema.cql's 'datacenter1': 3 to the cluster's own datacenter
+    name and node count (a factor above the node count makes every
+    QUORUM request fail as unavailable)."""
+    match = REPLICATION_RE.search(statement)
+    datacenters = {h.datacenter for h in hosts if h.datacenter}
+    if not match or len(datacenters) != 1:
+        return statement
+    datacenter = datacenters.pop()
+    factor = min(int(match.group(2)), len(hosts))
+    if (datacenter, factor) != (match.group(1), int(match.group(2))):
+        print(f"schema_tools: keyspace replication {datacenter}={factor} "
+              f"(schema.cql asks {match.group(1)}={match.group(2)}; "
+              f"cluster has {len(hosts)} node(s))", file=sys.stderr)
+    start, end = match.span(1)[0] - 1, match.span(2)[1]
+    return statement[:start] + f"'{datacenter}': {factor}" + statement[end:]
+
+
 def apply_schema(session, keyspace=SCHEMA_KEYSPACE, reset=False):
     if reset:
         session.execute(f"DROP KEYSPACE IF EXISTS {keyspace}")
+    hosts = list(session.cluster.metadata.all_hosts())
     for statement in schema_statements(keyspace):
+        if "CREATE KEYSPACE" in statement.upper():
+            statement = fit_replication(statement, hosts)
         if statement.upper().startswith("USE "):
             session.set_keyspace(keyspace)
         else:
@@ -78,11 +109,35 @@ def verify_schema(session, keyspace=SCHEMA_KEYSPACE):
         )
 
 
-def connect(host, port):
-    from cassandra.cluster import Cluster
+def contact_points(hosts=None):
+    """CASSANDRA_HOST (or ``hosts``), split on commas."""
+    hosts = hosts or os.getenv("CASSANDRA_HOST", "127.0.0.1")
+    return [h.strip() for h in hosts.split(",") if h.strip()]
 
-    cluster = Cluster([host], port=port)
-    return cluster, cluster.connect()
+
+def cluster(hosts=None, port=None, request_timeout=10.0, **kwargs):
+    """A Cluster on every contact point whose sessions use
+    CASSANDRA_CONSISTENCY (default LOCAL_QUORUM) for reads and writes, and
+    ``request_timeout`` seconds per request (the driver's default is 10)."""
+    from cassandra import ConsistencyLevel
+    from cassandra.cluster import EXEC_PROFILE_DEFAULT, Cluster, ExecutionProfile
+
+    level = os.getenv("CASSANDRA_CONSISTENCY", "LOCAL_QUORUM").upper()
+    profile = ExecutionProfile(
+        consistency_level=getattr(ConsistencyLevel, level),
+        request_timeout=request_timeout,
+    )
+    return Cluster(
+        contact_points(hosts),
+        port=port or int(os.getenv("CASSANDRA_PORT", "9042")),
+        execution_profiles={EXEC_PROFILE_DEFAULT: profile},
+        **kwargs,
+    )
+
+
+def connect(host, port):
+    c = cluster(host, port)
+    return c, c.connect()
 
 
 def main():

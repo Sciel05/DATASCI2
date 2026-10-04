@@ -36,13 +36,13 @@ os.environ["PYTHONPATH"] = os.pathsep.join(
 @pytest.fixture(scope="session")
 def cassandra_session():
     pytest.importorskip("cassandra", reason="cassandra-driver is not installed")
-    from cassandra.cluster import Cluster, NoHostAvailable
+    from cassandra.cluster import NoHostAvailable
 
-    from persistence.schema_tools import apply_schema, verify_schema
+    from persistence.schema_tools import apply_schema, cluster as make_cluster, verify_schema
 
     host = os.getenv("CASSANDRA_HOST", "127.0.0.1")
     port = int(os.getenv("CASSANDRA_PORT", "9042"))
-    cluster = Cluster([host], port=port, connect_timeout=5)
+    cluster = make_cluster(host, port, connect_timeout=5)
     try:
         session = cluster.connect()
     except NoHostAvailable:
