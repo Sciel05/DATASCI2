@@ -131,8 +131,8 @@ python -m pip install -r persistence/requirements.txt
 ```sql
 CREATE KEYSPACE IF NOT EXISTS surveillance
 WITH replication = {
-    'class': 'SimpleStrategy',
-    'replication_factor': 1
+    'class': 'NetworkTopologyStrategy',
+    'datacenter1': 3
 } AND durable_writes = true;
 
 USE surveillance;
@@ -171,20 +171,31 @@ CREATE TABLE IF NOT EXISTS anomalies (
 
 Both tables use `ticker` as the partition key and `(event_time, tick_id)` as clustering keys. The deterministic `tick_id` preserves distinct ticks in the same millisecond and makes Spark micro-batch retries idempotent. Queries remain partition-scoped and time ordered without `ALLOW FILTERING`.
 
-The primary key changed from the original schema. For an existing development database, export any data that must be retained, drop/recreate these two tables, and then reapply `schema.cql`; Cassandra cannot alter primary-key columns in place.
+The primary key changed from the original schema, and `schema.cql` only uses `CREATE ... IF NOT EXISTS`, so re-applying it keeps an older table as it is. `detect_anomalies.py --cassandra-sink` therefore checks the tables' columns before it starts and stops with a message naming what is missing. To recreate the keyspace (this deletes its data; Cassandra cannot alter primary-key columns in place):
 
-### 2. Initialize Cassandra in Docker
-
-Copy and apply the schema to the running Cassandra container:
-```powershell
-docker cp .\persistence\schema.cql surveillance-cassandra:/schema.cql
-docker exec -it surveillance-cassandra cqlsh -f /schema.cql
+```bash
+python -m persistence.schema_tools --reset    # from the repo root; --check only checks
 ```
 
-Verify tables in `cqlsh`:
-```sql
-DESCRIBE KEYSPACE surveillance;
+### 2. Start Cassandra (Docker stack)
+
+Cassandra 4.1 is part of the Docker stack in `stream-processing/docker/`, next to Kafka and Spark:
+
+```bash
+cd stream-processing/docker
+docker compose up -d --build
 ```
+
+The stack runs a **3-node Cassandra cluster** (`cassandra1`, `cassandra2`, `cassandra3`, one datacenter). The nodes join one at a time, so the first start takes a few minutes. The keyspace keeps 3 replicas of every row, and every client (sink, dashboard, tests) reads and writes at `LOCAL_QUORUM` (2 of 3), so the pipeline keeps running with any one node down. The reasoning and the measured node-failure drill are in [`evaluation/README.md`](../evaluation/README.md).
+
+The one-shot `cassandra-init` service applies `schema.cql` once all three nodes are healthy. From the host, `cassandra1` is on `localhost:9043`. Inside the stack the `pyspark` container uses all three nodes as contact points (`CASSANDRA_HOST=cassandra1,cassandra2,cassandra3`, `CASSANDRA_CONSISTENCY=LOCAL_QUORUM`). Each node keeps its data in its own volume (`cassandra1-data` ...). Check the ring and the tables with:
+
+```bash
+docker compose exec cassandra1 nodetool status      # three UN (Up/Normal) lines
+docker compose exec cassandra1 cqlsh -e "DESCRIBE KEYSPACE surveillance"
+```
+
+`CASSANDRA_HOST` accepts a comma-separated list everywhere. On a single local Cassandra, apply the schema with `python -m persistence.schema_tools`, not `cqlsh -f`: it lowers the replication factor to the number of nodes (a quorum of 3 replicas can't be met by one node).
 
 ---
 
@@ -192,12 +203,12 @@ DESCRIBE KEYSPACE surveillance;
 
 ### 1. Surveillance Dashboard (Streamlit Web UI)
 
-From the project root:
-```powershell
-streamlit run persistence/dashboard/app.py
+In the Docker stack (port 8501 is published):
+```bash
+docker exec -w /workspace docker-pyspark-1 streamlit run persistence/dashboard/app.py --server.address 0.0.0.0
 ```
 
-The web dashboard opens at `http://localhost:8501`.
+or natively from the project root: `streamlit run persistence/dashboard/app.py`. The web dashboard opens at `http://localhost:8501`.
 
 - **Mock Simulator Mode (Default):** Runs an advancing replay clock over the labeled CSV dataset, calculating real rolling statistics and triggering genuine simulated anomalies. Ideal for local development, grading review, and demos without needing a running Cassandra container.
 - **Live Cassandra Mode:** Set the toggle in the sidebar or launch with:
@@ -236,45 +247,34 @@ Every scored tick is stored in `raw_events`; rows with `is_anomaly = true` are a
 
 ## Testing & Verification Suite
 
+All tests run with pytest, in one command:
+
+```bash
+docker exec -w /workspace docker-pyspark-1 python3 -m pytest persistence/ -v
+```
+
+(or `pytest persistence/` from the repo root natively). Tests that touch Cassandra each run in a throwaway keyspace `surveillance_test_<id>` built from `schema.cql` and dropped afterwards, so they never write into `surveillance`. Without a reachable Cassandra they are skipped with a reason; inside the Docker stack `REQUIRE_CASSANDRA=1` makes that a failure instead. The streaming test is skipped on native Windows (Spark checkpoints need winutils there).
+
 ### Persistence Layer Tests
 
-1. **Direct Python -> Cassandra:**
-   ```powershell
-   python persistence/test_persistence.py
-   ```
-   Validates basic Cassandra connection, prepared statement insertion, and partition query.
+1. **Direct Python -> Cassandra** (`test_persistence.py`): an anomaly row round-trips with every field unchanged.
 
-2. **Spark Batch DataFrame -> Cassandra:**
-   ```powershell
-   python persistence/test_spark_sink.py
-   ```
-   Validates schema mapping, `is_anomaly = true` filtering, and partition writing via PySpark.
+2. **Spark Batch DataFrame -> Cassandra** (`test_spark_sink.py`): both ticks land in `raw_events`, only the flagged one in `anomalies` with all its fields; writing the same batch twice (a retried micro-batch) leaves one row per tick.
 
-3. **Spark Structured Streaming -> foreachBatch -> Cassandra:**
-   ```powershell
-   # Run inside Spark 3.5.9 Docker container
-   python persistence/test_streaming_sink.py
-   ```
-   Validates continuous streaming micro-batches, checkpointing, and foreachPartition persistence.
+3. **Spark Structured Streaming -> foreachBatch -> Cassandra** (`test_streaming_sink.py`): a fixed input of 9 ticks in 3 files runs as 3 micro-batches to completion (`availableNow`); Cassandra must then hold exactly those 9 ticks and the 3 flagged ones.
+
+End to end (producer -> Kafka -> detector `--cassandra-sink` -> Cassandra, compared tick by tick with the offline detector) is `stream-processing/parity_check.py run --day 2026-09-16 --sink cassandra`; see `stream-processing/README.md`.
 
 ### Alerting & Dashboard Tests
 
-4. **Alerting Pipeline Unit Tests:**
-   ```powershell
-   python persistence/test_alerting_pipeline.py -v
-   ```
-   Validates:
+4. **Alerting Pipeline Unit Tests** (`test_alerting_pipeline.py`). Validates:
    - `test_burst_debouncing_and_escalation`: Multi-tick burst aggregation and severity escalation.
    - `test_cooldown_enforcement`: Suppression of redundant alerts during active cooldown windows.
    - `test_mock_client_math_grounding`: Rolling statistics, Z-score, and VWAP divergence calculations.
    - `test_notifier_audit_logging`: Structured JSON record integrity and latency fields.
    - `test_severity_classification`: Threshold boundaries for CRITICAL, WARNING, and INFO tiers.
 
-5. **Objective 2 Contract Bridge:**
-   ```powershell
-   python -m unittest persistence.test_objective2_contract -v
-   ```
-   Validates both the original eight-field stream and the refined risk/incident fields through Spark sink normalization.
+5. **Objective 2 Contract Bridge** (`test_objective2_contract.py`). Validates both the original eight-field stream and the refined risk/incident fields through Spark sink normalization.
 
 ---
 

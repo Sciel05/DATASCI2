@@ -30,6 +30,18 @@ Usage:
         --speed 200 --max-gap-sec 5
 
     python producer.py --csv ticks.csv --topic market-ticks --max-rate
+
+--live (alias --restamp-now) replaces each tick's event_time_ms with the
+wall-clock time it is scheduled to be sent (replay start + its paced offset),
+so a replay looks like live trading to anything that filters on "the last N
+minutes" (e.g. the live dashboard). Spacing between ticks is the original
+spacing divided by --speed, with gaps capped by --max-gap-sec. With
+--max-rate there is no schedule, so ticks get the actual send time.
+--loop replays the dataset forever; combine it with --live for a demo that
+keeps running.
+
+    python producer.py --csv ticks.csv --topic market-ticks-live \
+        --speed 5 --max-gap-sec 5 --live --loop
 """
 
 import argparse
@@ -62,8 +74,9 @@ def main():
                     help="Print a progress line every N messages")
     ap.add_argument("--loop", action="store_true",
                     help="Continuously loop replay over the dataset")
-    ap.add_argument("--live", action="store_true",
-                    help="Anchor timestamps to current wall-clock time for real-time live pipeline/dashboard")
+    ap.add_argument("--live", "--restamp-now", dest="live", action="store_true",
+                    help="Stamp each tick with the wall-clock time it is sent "
+                         "instead of its original event time (live pipeline/dashboard)")
     args = ap.parse_args()
 
     df = pd.read_csv(args.csv).sort_values("event_time_ms").reset_index(drop=True)
@@ -100,6 +113,7 @@ def main():
         time_debt_ms = 0.0  # accumulated real-time gap removed by --max-gap-sec
 
         for _, row in df.iterrows():
+            event_ts_ms = int(row["event_time_ms"])
             if not args.max_rate:
                 if args.max_gap_sec is not None:
                     gap_ms = row["event_time_ms"] - prev_event_ms
@@ -109,13 +123,17 @@ def main():
                     prev_event_ms = row["event_time_ms"]
 
                 target_elapsed = (row["event_time_ms"] - first_event_ms - time_debt_ms) / 1000.0 / args.speed
+                if args.live:
+                    # the scheduled send time, not time.time(): stays in order and
+                    # keeps the (sped-up) spacing even when a send runs late
+                    event_ts_ms = int(start_wall * 1000 + target_elapsed * 1000)
                 actual_elapsed = time.time() - start_wall
                 sleep_for = target_elapsed - actual_elapsed
                 if sleep_for > 0:
                     time.sleep(sleep_for)
-
-            # In live mode, stamp with current wall-clock time so timestamps align with real-time lookback
-            event_ts_ms = int(time.time() * 1000) if args.live else int(row["event_time_ms"])
+            elif args.live:
+                # no schedule without pacing, so the actual send time
+                event_ts_ms = int(time.time() * 1000)
 
             payload = {
                 "ticker": row["ticker"],

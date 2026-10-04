@@ -1,79 +1,38 @@
-import os
-from cassandra.cluster import Cluster
+"""Python driver -> Cassandra: an anomaly row round-trips unchanged."""
+
 from datetime import datetime, timezone
 
 
-# Connect to Cassandra running in Docker
-cluster = Cluster(
-    [os.getenv("CASSANDRA_HOST", "127.0.0.1")],
-    port=int(os.getenv("CASSANDRA_PORT", "9042")),
-)
-
-# Connect directly to our project keyspace
-session = cluster.connect("surveillance")
-
-print("Connected to Cassandra successfully.")
-
-
-# Create a test anomaly similar to what Task 2 will eventually produce
-event_time = datetime.now(timezone.utc)
-
-insert_anomaly = session.prepare("""
-    INSERT INTO anomalies (
-        ticker,
-        event_time,
-        tick_id,
-        price,
-        volume,
-        zscore,
-        vwap_divergence,
-        is_anomaly,
-        anomaly_type,
-        risk_score,
-        signals,
-        incident_id
+def test_anomaly_round_trip(cassandra_session):
+    event_time = datetime(2026, 9, 16, 14, 30, 0, 123000, tzinfo=timezone.utc)
+    tick_id = "PYTEST_A-1789569000123-0"
+    cassandra_session.execute(
+        """
+        INSERT INTO anomalies (
+            ticker, event_time, tick_id, price, volume, zscore, vwap_divergence,
+            is_anomaly, anomaly_type, risk_score, signals, incident_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            "PYTEST_A", event_time, tick_id, 180.25, 5000.0, 4.21, 0.037,
+            True, "price_shock", 1.25, "vwap", "PYTEST_A-1789569000123",
+        ),
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-""")
 
-session.execute(
-    insert_anomaly,
-    (
-        "AAPL",
-        event_time,
-        f"AAPL-{int(event_time.timestamp() * 1000)}-0",
-        180.25,
-        5000.0,
-        4.21,
-        0.037,
-        True,
-        "price_shock",
-        1.25,
-        "vwap",
-        f"AAPL-{int(event_time.timestamp() * 1000)}",
-    )
-)
+    rows = list(cassandra_session.execute(
+        "SELECT * FROM anomalies WHERE ticker = %s", ("PYTEST_A",)
+    ))
 
-print("Test anomaly inserted successfully.")
-
-
-# Read the data back from Cassandra
-select_anomalies = session.prepare("""
-    SELECT *
-    FROM anomalies
-    WHERE ticker = ?
-    LIMIT 5
-""")
-
-rows = session.execute(select_anomalies, ("AAPL",))
-
-print("\nStored AAPL anomalies:")
-
-for row in rows:
-    print(row)
-
-
-# Close the Cassandra connection
-cluster.shutdown()
-
-print("\nConnection closed.")
+    assert len(rows) == 1
+    row = rows[0]
+    # The driver returns timestamps as naive UTC datetimes.
+    assert row.event_time == event_time.replace(tzinfo=None)
+    assert row.tick_id == tick_id
+    assert (row.price, row.volume, row.zscore, row.vwap_divergence) == (180.25, 5000.0, 4.21, 0.037)
+    assert row.is_anomaly is True
+    assert row.anomaly_type == "price_shock"
+    assert row.risk_score == 1.25
+    assert row.signals == "vwap"
+    assert row.incident_id == "PYTEST_A-1789569000123"
+    # Columns not written stay null rather than defaulting.
+    assert row.ewma_divergence is None and row.cusum_price is None

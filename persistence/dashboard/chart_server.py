@@ -24,6 +24,9 @@ logger = logging.getLogger("chart_server")
 _SERVER_INSTANCE = None
 _SERVER_LOCK = threading.Lock()
 PORT = 8506
+# 0.0.0.0 in the Docker stack, where the browser reaches it through the
+# published port 8506; loopback-only when run natively.
+HOST = os.getenv("CHART_SERVER_HOST", "127.0.0.1")
 
 
 def get_chart_data_dict(ticker: str = "AAPL", lookback: int = 15, is_live: bool = True) -> dict:
@@ -236,11 +239,11 @@ def start_chart_server(port: int = PORT):
             return _SERVER_INSTANCE
 
         try:
-            server = ReusableTCPServer(("127.0.0.1", port), ChartDataHandler)
+            server = ReusableTCPServer((HOST, port), ChartDataHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True, name="ChartDataServer")
             thread.start()
             _SERVER_INSTANCE = server
-            print(f"[ChartServer] Background streaming micro-API started on http://127.0.0.1:{port}/api/chart_data")
+            print(f"[ChartServer] Background streaming micro-API started on http://{HOST}:{port}/api/chart_data")
             return _SERVER_INSTANCE
         except OSError as e:
             # Port might already be bound by a previous instance

@@ -1,0 +1,39 @@
+{
+  "run_id": "368cb371",
+  "finished_utc": "2026-10-03T23:59:03+00:00",
+  "producer_start_utc_ms": 1791071567912,
+  "settings": {
+    "minutes": 6.0,
+    "speed": 100.0,
+    "warmup_sec": 60,
+    "consistency": "LOCAL_QUORUM"
+  },
+  "completeness": {
+    "produced_to_kafka": 40271,
+    "stored_raw_events": 40271,
+    "missing": 0,
+    "stored_anomalies": 1153
+  },
+  "rate_ticks_per_s": 112.3,
+  "latency_ms": {
+    "raw_events": {
+      "n": 40271,
+      "min": 529.5,
+      "p50": 2039.0,
+      "p95": 26088.8,
+      "p99": 28905.5,
+      "max": 31136.8,
+      "mean": 4521.3
+    },
+    "anomalies": {
+      "n": 1153,
+      "min": 1216.0,
+      "p50": 2767.1,
+      "p95": 29742.4,
+      "p99": 32998.3,
+      "max": 33227.9,
+      "mean": 5464.5
+    }
+  },
+  "latency_csv": "evaluation/results/live_368cb371_latency.csv"
+}

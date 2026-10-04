@@ -1,3 +1,22 @@
+x-cassandra-env: &cassandra-env
+  CASSANDRA_CLUSTER_NAME: surveillance
+  CASSANDRA_SEEDS: cassandra1
+  CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+  CASSANDRA_DC: datacenter1   # the stock name, so schema.cql also works on a lone default node
+  MAX_HEAP_SIZE: 384M         # x3 nodes, next to Kafka and Spark in one Docker VM
+  HEAP_NEWSIZE: 96M
+
+x-cassandra-node: &cassandra-node
+  image: cassandra:4.1
+  healthcheck:
+    # healthy = this node answers CQL; nodetool also lists it as Up/Normal
+    test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' >/dev/null && nodetool status | grep -q \"^UN.*$$(hostname -i)\""]
+    interval: 10s
+    timeout: 20s
+    retries: 40
+    start_period: 40s
+  restart: unless-stopped
+
 services:
   kafka:
     image: apache/kafka:latest
@@ -15,13 +34,80 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
+  # Three-node Cassandra cluster, one datacenter. schema.cql keeps 3 replicas
+  # of every row (one per node), and the clients read and write at
+  # LOCAL_QUORUM (2 of 3), so any single node can be down with no failed
+  # writes and no stale reads. Justification: evaluation/README.md.
+  #
+  # Nodes join one at a time (each waits for the previous one to be
+  # healthy); Cassandra doesn't support bootstrapping several at once.
+  # Only cassandra1 is published to the host (9043); the clients inside the
+  # stack use all three as contact points.
+  cassandra1:
+    <<: *cassandra-node
+    environment:
+      <<: *cassandra-env
+    ports:
+      - "9043:9042"   # host 9043, so a separate Cassandra can keep 9042
+    volumes:
+      - cassandra1-data:/var/lib/cassandra
+
+  cassandra2:
+    <<: *cassandra-node
+    environment:
+      <<: *cassandra-env
+    depends_on:
+      cassandra1:
+        condition: service_healthy
+    volumes:
+      - cassandra2-data:/var/lib/cassandra
+
+  cassandra3:
+    <<: *cassandra-node
+    environment:
+      <<: *cassandra-env
+    depends_on:
+      cassandra2:
+        condition: service_healthy
+    volumes:
+      - cassandra3-data:/var/lib/cassandra
+
+  # One-shot: applies persistence/schema.cql once all three nodes accept
+  # queries, then exits. Idempotent (CREATE ... IF NOT EXISTS).
+  cassandra-init:
+    image: cassandra:4.1
+    depends_on:
+      cassandra3:
+        condition: service_healthy
+    volumes:
+      - ../../persistence/schema.cql:/schema.cql:ro
+    entrypoint: ["cqlsh", "cassandra1", "-f", "/schema.cql"]
+    restart: "no"
+
   pyspark:
     build: .
     depends_on:
       - kafka
+      - cassandra1
+    environment:
+      CASSANDRA_HOST: cassandra1,cassandra2,cassandra3
+      CASSANDRA_CONSISTENCY: LOCAL_QUORUM
+      USE_MOCK: "False"              # the dashboard reads the cluster, not the CSV replay
+      CHART_SERVER_HOST: 0.0.0.0     # dashboard chart API, fetched by the browser
+      SPARK_CONF_DIR: /workspace/stream-processing/docker/spark-conf   # local[4], 8 shuffle partitions
+      # a missing Cassandra fails the persistence tests here instead of skipping them
+      REQUIRE_CASSANDRA: "1"
+    ports:
+      - "8501:8501"   # Streamlit dashboard (persistence/dashboard/app.py)
+      - "8506:8506"   # its chart data API (persistence/dashboard/chart_server.py)
     volumes:
       - ../..:/workspace
     working_dir: /workspace
     tty: true
     stdin_open: true
     command: sleep infinity
+
+volumes:
+  cassandra1-data:
+  cassandra2-data:
+  cassandra3-data:

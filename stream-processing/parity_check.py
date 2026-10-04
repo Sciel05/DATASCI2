@@ -21,6 +21,15 @@ across batch boundaries, reads the output topic back, compares, and always
 deletes the topics (and the consumer group) it created. Detector flags after `--` are passed to both
 the Spark job and the offline run.
 
+`--sink cassandra` runs the detector with --cassandra-sink instead, into a
+throwaway keyspace (parity_<id>) built from persistence/schema.cql, and
+compares what Cassandra stored: every tick in raw_events (price, volume,
+tick_id) and every flagged tick in anomalies (all fields). The keyspace is
+dropped afterwards, like the topics. Needs CASSANDRA_HOST (set in the Docker
+stack).
+
+    python3 parity_check.py run --day 2026-09-16 --sink cassandra
+
 `slice` and `compare` do the first and last step alone, for a pipeline run
 made by hand (output dumped to parity/spark_output_<days>.jsonl).
 
@@ -29,6 +38,7 @@ Exits non-zero if the two disagree.
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -280,7 +290,61 @@ def delete_group(admin, group, attempts=5):
             time.sleep(2)
 
 
-def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size):
+def persistence_module(name):
+    """Imports persistence/<name>.py the way detect_anomalies.py does."""
+    persistence_dir = str(HERE.parent / "persistence")
+    if persistence_dir not in sys.path:
+        sys.path.insert(0, persistence_dir)
+    return __import__(name)
+
+
+def cassandra_connect():
+    schema_tools = persistence_module("schema_tools")
+    return schema_tools.connect(os.getenv("CASSANDRA_HOST", "127.0.0.1"), int(os.getenv("CASSANDRA_PORT", "9042")))
+
+
+def read_cassandra(session, keyspace, table):
+    rows = [r._asdict() for r in session.execute(f"SELECT * FROM {keyspace}.{table}")]
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["ticker", "ts_ms"])
+    # the driver returns naive UTC datetimes, stored at millisecond precision
+    out["ts_ms"] = (pd.to_datetime(out["event_time"]) - pd.Timestamp("1970-01-01")) // pd.Timedelta(milliseconds=1)
+    return out
+
+
+def report_cassandra(days, n_ticks, offline, raw, anomalies):
+    """raw_events must hold every tick; anomalies every flagged tick with all
+    fields. Returns True if both match the offline run."""
+    print(f"slice {slice_name(days)}: {n_ticks:,} ticks")
+    flagged = offline[offline["is_anomaly"].astype(bool)]
+    ok = True
+    for table, expected, stored in (
+        ("raw_events", offline[["ticker", "ts_ms", "price", "volume", "tick_id"]], raw),
+        ("anomalies", flagged, anomalies),
+    ):
+        print(f"\n{table}: offline rows {len(expected):,}   cassandra rows {len(stored):,}")
+        problems, counts, examples, _ = compare_frames(expected, stored)
+        for name, n in counts.items():
+            print(f"  {name:<16} mismatches: {n}")
+            if name in examples:
+                print(examples[name].to_string(index=False))
+        if problems:
+            print(f"  {table} FAILED:\n    " + "\n    ".join(problems))
+            ok = False
+    print("\nflags by type (offline vs cassandra):")
+    for t in ("price_shock", "wash_trade"):
+        stored_n = int((anomalies["anomaly_type"] == t).sum()) if "anomaly_type" in anomalies else 0
+        print(f"  {t:<12} {int((flagged['anomaly_type'] == t).sum()):>5} vs {stored_n:>5}")
+    if ok:
+        print(f"\nPARITY OK: all {n_ticks:,} ticks stored in raw_events and all {len(flagged):,} "
+              f"flagged ticks in anomalies match (floats within {TOLERANCE:g} relative)")
+    else:
+        print("\nPARITY FAILED")
+    return ok
+
+
+def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size, sink="kafka"):
     args = parse_args(detector_argv)
     write_slice(days)
     # Score offline from the same file the producer reads, parsed the same
@@ -292,7 +356,22 @@ def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size):
     in_topic, out_topic = f"parity-ticks-{run_id}", f"parity-anomalies-{run_id}"
     checkpoint = tempfile.mkdtemp(prefix="parity-ckpt-")
     admin = kafka_admin(bootstrap)
-    create_topics(admin, [(in_topic, 8), (out_topic, 1)])
+    to_cassandra = sink == "cassandra"
+    keyspace = f"parity_{run_id}"
+    env = dict(os.environ)
+    if to_cassandra:
+        schema_tools = persistence_module("schema_tools")
+        cluster, session = cassandra_connect()
+        schema_tools.apply_schema(session, keyspace, reset=True)
+        print(f"created keyspace {keyspace}")
+        env["CASSANDRA_KEYSPACE"] = keyspace
+        sink_args = ["--cassandra-sink"]
+        topics = [in_topic]
+        create_topics(admin, [(in_topic, 8)])
+    else:
+        sink_args = ["--output-topic", out_topic]
+        topics = [in_topic, out_topic]
+        create_topics(admin, [(in_topic, 8), (out_topic, 1)])
     try:
         subprocess.run(
             [sys.executable, str(PRODUCER), "--csv", str(slice_path(days)), "--topic", in_topic,
@@ -301,11 +380,11 @@ def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size):
         )
         spark = subprocess.run(
             [spark_submit, "--packages", KAFKA_PACKAGE, str(HERE / "detect_anomalies.py"),
-             "--bootstrap-servers", bootstrap, "--input-topic", in_topic, "--output-topic", out_topic,
+             "--bootstrap-servers", bootstrap, "--input-topic", in_topic, *sink_args,
              "--starting-offsets", "earliest", "--trigger-once",
              "--max-offsets-per-trigger", str(batch_size), "--checkpoint-dir", checkpoint,
              *detector_argv],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=env,
         )
         for line in spark.stderr.splitlines():
             if "[detect_anomalies]" in line:
@@ -317,13 +396,25 @@ def cmd_run(days, detector_argv, bootstrap, spark_submit, batch_size):
         n_batches = len([p for p in commits.iterdir() if p.name.isdigit()]) if commits.exists() else 0
         print(f"spark job committed {n_batches} micro-batches (<= {batch_size} records each)")
 
-        lines = consume_all(admin, bootstrap, out_topic)
-        spark_output_path(days).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if to_cassandra:
+            raw = read_cassandra(session, keyspace, "raw_events")
+            anomalies = read_cassandra(session, keyspace, "anomalies")
+        else:
+            lines = consume_all(admin, bootstrap, out_topic)
+            spark_output_path(days).write_text("\n".join(lines) + "\n", encoding="utf-8")
     finally:
-        delete_topics(admin, [in_topic, out_topic])
+        delete_topics(admin, topics)
         shutil.rmtree(checkpoint, ignore_errors=True)
+        if to_cassandra:
+            session.execute(f"DROP KEYSPACE IF EXISTS {keyspace}")
+            print(f"dropped keyspace {keyspace}")
+            cluster.shutdown()
 
-    ok = report(days, len(ticks), run_offline(ticks, args), parse_spark_rows(lines))
+    offline = run_offline(ticks, args)
+    if to_cassandra:
+        ok = report_cassandra(days, len(ticks), offline, raw, anomalies)
+    else:
+        ok = report(days, len(ticks), offline, parse_spark_rows(lines))
     sys.exit(0 if ok else 1)
 
 
@@ -345,6 +436,8 @@ def main():
             p.add_argument("--bootstrap-servers", default="kafka:9092")
             p.add_argument("--spark-submit", default=shutil.which("spark-submit") or DEFAULT_SPARK_SUBMIT)
             p.add_argument("--batch-size", type=int, default=2000, help="max Kafka records per micro-batch")
+            p.add_argument("--sink", choices=["kafka", "cassandra"], default="kafka",
+                           help="where the detector writes: an output topic, or Cassandra via --cassandra-sink")
         if name != "slice":
             p.add_argument("detector_args", nargs=argparse.REMAINDER, help="-- then detect_anomalies.py flags")
     a = ap.parse_args()
@@ -355,7 +448,7 @@ def main():
     elif a.cmd == "compare":
         cmd_compare(a.day, extra)
     else:
-        cmd_run(a.day, extra, a.bootstrap_servers, a.spark_submit, a.batch_size)
+        cmd_run(a.day, extra, a.bootstrap_servers, a.spark_submit, a.batch_size, a.sink)
 
 
 if __name__ == "__main__":
