@@ -1,0 +1,39 @@
+{
+  "run_id": "a227e825",
+  "finished_utc": "2026-10-04T01:16:44+00:00",
+  "producer_start_utc_ms": 1791076229872,
+  "settings": {
+    "minutes": 6.0,
+    "speed": 100.0,
+    "warmup_sec": 60,
+    "consistency": "LOCAL_QUORUM"
+  },
+  "completeness": {
+    "produced_to_kafka": 40311,
+    "stored_raw_events": 40311,
+    "missing": 0,
+    "stored_anomalies": 1156
+  },
+  "rate_ticks_per_s": 112.2,
+  "latency_ms": {
+    "raw_events": {
+      "n": 40311,
+      "min": 575.4,
+      "p50": 2314.6,
+      "p95": 26909.9,
+      "p99": 29942.5,
+      "max": 32455.3,
+      "mean": 4938.5
+    },
+    "anomalies": {
+      "n": 1156,
+      "min": 1489.7,
+      "p50": 3407.9,
+      "p95": 28255.1,
+      "p99": 33051.7,
+      "max": 33555.3,
+      "mean": 6058.3
+    }
+  },
+  "latency_csv": "evaluation/results/live_a227e825_latency.csv"
+}

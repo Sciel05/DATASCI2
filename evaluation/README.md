@@ -1,7 +1,7 @@
 # Pipeline Integration & Evaluation (Objective 4)
 
 **Status: first full evaluation done (2026-10-04)** on the Docker stack
-with the 3-node Cassandra cluster. Still to do: the 10–15 min recorded demo
+with the 3-node Cassandra cluster, and again with 3 Kafka brokers. Still to do: the 10–15 min recorded demo
 run with dashboard screenshots (see [Remaining work](#remaining-work)).
 
 Per the proposal's Specific Objective 4, this measures the integrated
@@ -23,6 +23,9 @@ docker compose -f stream-processing/docker/docker-compose.yml exec pyspark \
 # live run (producer --live) with cassandra3 stopped for 2 minutes in the middle:
 # latency, completeness under a node failure, RF=1 vs RF=3 probe (run on the host)
 python evaluation/failover_drill.py
+
+# on the 3-broker stack (docker-compose.kafka3.yml), stopping a Kafka broker
+python evaluation/failover_drill.py --kafka3 --node kafka3
 ```
 
 Each run uses its own Kafka topic and Cassandra keyspace (built from
@@ -38,7 +41,7 @@ land in `evaluation/results/` (`batch_<id>.json`, `failover_<id>.json`,
 | `failover_drill.py` | Runs `live` for 6 min, stops `cassandra3` at minute 2, starts it at minute 4, probes in every phase, splits latency by phase |
 
 **Test setup:** Windows 11 laptop, Docker Desktop (WSL2 VM: 16 vCPUs,
-6.7 GB RAM) running Kafka (1 broker), 3 × Cassandra 4.1 (384 MB heap each)
+6.7 GB RAM) running Kafka (1 broker; 3 in section 6), 3 × Cassandra 4.1 (384 MB heap each)
 and Spark 4.2 in `local[4]` mode (`stream-processing/docker/spark-conf/`).
 Dataset: `aapl_msft_googl_tsla_nvda_ticks_labeled.csv`, 140,751 ticks over
 5 tickers and 5 trading days, with 581 injected `price_shock` and 595
@@ -154,6 +157,39 @@ the dashboard. Writes the stopped node missed are replayed to it by the
 other two (hinted handoff) when it rejoins; reads stay correct meanwhile
 because a quorum always includes an up-to-date replica.
 
+### 6. Three Kafka brokers (optional stack)
+
+Same tests on the 3-broker stack (`docker-compose.kafka3.yml`: 3 KRaft
+brokers, topics with 3 replicas and `min.insync.replicas=2`, producer
+`acks=all` + idempotence). Runs: batch `6b3260e8`, drill `a227e825`
+(broker `kafka3` stopped).
+
+| | 1 broker | 3 brokers |
+|---|---|---|
+| Completeness, whole dataset | 140,751 / 140,751 | 140,751 / 140,751 |
+| Accuracy | batch `35eae9d1` | identical to it (same input, same detector settings: both runs predate the price-shock tuning) |
+| Producer → Kafka | 10,498 msgs/s | **2,210 msgs/s** |
+| Detector + sink, sustained | 1,264 ticks/s | 1,104 ticks/s |
+| Live latency, steady state p50 / p95 | 1.83 s / 2.97 s | 2.08 s / 3.40 s |
+| Kafka memory (all brokers) | 0.82 GB (1 GB default heap) | 0.86 GB (3 × 256 MB heap) |
+
+**Broker `kafka3` stopped for 118 s mid-run** (back 35 s after starting):
+
+| | Before | `kafka3` down | After restart |
+|---|---|---|---|
+| Ticks stored | ok | **0 lost** (40,311 sent = 40,311 stored, the exact first 40,311 dataset ticks per ticker) | ok |
+| Latency p50 / p95 | — | 1.98 s / 3.20 s | 2.12 s / 3.54 s |
+
+The partitions `kafka3` led moved to the other two brokers; the producer
+(retrying idempotently) and the Spark consumer followed the new leaders
+without errors or a latency spike. With a single broker the same stop halts
+ingestion outright: the producer can't deliver and the detector has nothing
+to read until it returns.
+
+The cost is producer throughput (about 5× lower): with `acks=all` each send
+waits for 2 of 3 brokers. 2,210 msgs/s is still ~20× the live demo rate,
+and the detector (1,100 ticks/s) remains the bottleneck either way.
+
 ## The 3-node design and why
 
 Configured in `stream-processing/docker/docker-compose.yml` and
@@ -175,9 +211,11 @@ quorum of 3 can't be met by one node.
 **Honest limits of this setup:** all three nodes share one machine, one disk
 and one Docker VM, so this demonstrates the replication and consistency
 behaviour, not hardware fault tolerance; in production each node would be a
-separate host (ideally separate racks or zones). Kafka is still a single
-broker with replication factor 1, so it is now the pipeline's single point
-of failure; a 3-broker Kafka with RF=3 topics would be the matching change.
+separate host (ideally separate racks or zones). Kafka runs a single
+broker by default (replication factor 1, the least memory); the optional
+3-broker stack (section 6) removes that single point of failure. Spark
+runs in local mode, so the detector itself is one process: its checkpoint
+lets it resume without loss after a crash, but not without a pause.
 
 ## Remaining work
 

@@ -17,6 +17,11 @@ Run on the host, from the repository root, with the stack up:
 
     python evaluation/failover_drill.py
 
+With the 3-broker stack (docker-compose.kafka3.yml) a Kafka broker can be
+the node stopped instead; the probe still runs against Cassandra:
+
+    python evaluation/failover_drill.py --kafka3 --node kafka3
+
 Writes evaluation/results/failover_<live run id>.json.
 """
 
@@ -32,7 +37,8 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPOSE = ["docker", "compose", "-f", str(ROOT / "stream-processing" / "docker" / "docker-compose.yml")]
+DOCKER_DIR = ROOT / "stream-processing" / "docker"
+COMPOSE = ["docker", "compose", "-f", str(DOCKER_DIR / "docker-compose.yml")]
 RESULTS = ROOT / "evaluation" / "results"
 
 
@@ -60,12 +66,17 @@ def docker_time(container_id, field):
 
 
 def wait_healthy(service, timeout_s=300):
+    """Until the container's healthcheck passes; a container without one
+    (the Kafka brokers) counts once it has run for 30 s."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         cid = compose("ps", "-q", service).stdout.strip()
-        state = subprocess.run(["docker", "inspect", "-f", "{{.State.Health.Status}}", cid],
+        state = subprocess.run(["docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}"
+                                "{{else}}{{.State.Status}}{{end}}", cid],
                                capture_output=True, text=True).stdout.strip()
         if state == "healthy":
+            return
+        if state == "running" and time.time() - docker_time(cid, "StartedAt") / 1000 > 30:
             return
         time.sleep(5)
     sys.exit(f"{service} not healthy after {timeout_s}s")
@@ -79,7 +90,10 @@ def main():
     ap.add_argument("--down-at", type=int, default=120, help="seconds into the live run")
     ap.add_argument("--up-at", type=int, default=240, help="seconds into the live run")
     ap.add_argument("--speed", type=float, default=100.0)
+    ap.add_argument("--kafka3", action="store_true", help="the stack runs with docker-compose.kafka3.yml")
     args = ap.parse_args()
+    if args.kafka3:
+        COMPOSE.extend(["-f", str(DOCKER_DIR / "docker-compose.kafka3.yml")])
 
     probe("setup")
     phases = {"before": probe("before")}

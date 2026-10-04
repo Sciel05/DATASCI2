@@ -527,8 +527,10 @@ docker compose up -d --build
 
 # create the topic once
 docker exec docker-kafka-1 /opt/kafka/bin/kafka-topics.sh \
-    --create --topic market-ticks --partitions 8 --replication-factor 1 \
+    --create --topic market-ticks --partitions 8 \
     --bootstrap-server localhost:9092
+# (no --replication-factor: the brokers' default, 1 here and 3 with
+# docker-compose.kafka3.yml)
 
 # the pyspark container has Java 17, PySpark 4.2.0, pyarrow, pandas,
 # confluent-kafka -- the whole repo is mounted at /workspace
@@ -561,6 +563,25 @@ directory name): `docker-kafka-1`, `docker-pyspark-1`,
 9043; `cassandra-init` applies `persistence/schema.cql` once all three are
 healthy) and publishes port 8501 for the Streamlit dashboard. See
 `persistence/README.md` and `evaluation/README.md`.
+
+**Three Kafka brokers (optional).** `docker/docker-compose.kafka3.yml`
+turns the single broker into three (KRaft, each broker + controller,
+256 MB heap each): new topics get 3 replicas with
+`min.insync.replicas=2`, and the producer writes with `acks=all` and
+idempotence, so any one broker can be stopped without losing or
+duplicating a tick. Layer it on the main file, and pass both files to
+every later `docker compose` command:
+
+```bash
+cd stream-processing/docker
+docker compose -f docker-compose.yml -f docker-compose.kafka3.yml up -d
+```
+
+`kafka` stays the first broker's name, so `--bootstrap-servers kafka:9092`
+works unchanged. Switching between one and three brokers recreates the
+Kafka containers, so topics start empty. The three brokers together use
+about 0.9 GB (0.8 GB for the single default broker), measured; results in
+`evaluation/README.md`.
 
 ### Parity check (streaming vs offline)
 

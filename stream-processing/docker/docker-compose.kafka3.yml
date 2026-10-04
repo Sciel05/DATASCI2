@@ -1,0 +1,64 @@
+# Optional: three Kafka brokers instead of one. Layer it on the main file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.kafka3.yml up -d
+#
+# and pass both -f flags to every later `docker compose` command (or set
+# COMPOSE_FILE=docker-compose.yml;docker-compose.kafka3.yml on Windows,
+# ':' instead of ';' elsewhere). Switching between 1 and 3 brokers recreates
+# the Kafka containers, so topics and their messages start empty.
+#
+# `kafka` stays broker 1 under the same name, so every client's
+# `--bootstrap-servers kafka:9092` keeps working; the brokers' metadata
+# hands clients the other two. Each node is both broker and controller
+# (KRaft), so the controller quorum survives one node down too.
+#
+# New topics get 3 replicas and min.insync.replicas=2: with the producer's
+# acks=all, a tick is acknowledged once 2 of 3 brokers have it, and any one
+# broker can be lost without losing acknowledged ticks or stopping writes.
+# Heaps are capped at 256 MB each: the Docker VM also runs three Cassandra
+# nodes and Spark (evaluation/README.md).
+
+x-kafka-env: &kafka-env
+  CLUSTER_ID: "o7FYl9NrQYiP-q-8xZ-PSQ"   # any base64 UUID, the same on all three
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093,2@kafka2:9093,3@kafka3:9093
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_HEAP_OPTS: "-Xmx256m -Xms256m"
+
+services:
+  kafka:
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+    restart: unless-stopped
+
+  kafka2:
+    image: apache/kafka:latest
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9092
+    restart: unless-stopped
+
+  kafka3:
+    image: apache/kafka:latest
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9092
+    restart: unless-stopped
+
+  pyspark:
+    depends_on:
+      - kafka2
+      - kafka3

@@ -223,7 +223,8 @@ def kafka_admin(bootstrap):
 def create_topics(admin, specs):
     from confluent_kafka.admin import NewTopic
 
-    futures = admin.create_topics([NewTopic(name, num_partitions=p, replication_factor=1) for name, p in specs])
+    # replication factor -1: the brokers' default (3 with docker-compose.kafka3.yml)
+    futures = admin.create_topics([NewTopic(name, num_partitions=p, replication_factor=-1) for name, p in specs])
     for name, f in futures.items():
         f.result(timeout=30)
         print(f"created topic {name}")

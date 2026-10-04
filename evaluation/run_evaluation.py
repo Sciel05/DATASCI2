@@ -71,7 +71,8 @@ def kafka_admin(bootstrap):
 def create_topic(admin, name):
     from confluent_kafka.admin import NewTopic
 
-    for f in admin.create_topics([NewTopic(name, num_partitions=PARTITIONS, replication_factor=1)]).values():
+    # replication factor -1: the brokers' default (1 broker: 1; docker-compose.kafka3.yml: 3)
+    for f in admin.create_topics([NewTopic(name, num_partitions=PARTITIONS, replication_factor=-1)]).values():
         f.result(timeout=30)
 
 

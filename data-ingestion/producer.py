@@ -96,6 +96,11 @@ def main():
         "bootstrap.servers": args.bootstrap_servers,
         "linger.ms": 5,        # small batching window, keeps latency low
         "compression.type": "lz4",
+        # a tick counts as sent once every in-sync replica has it (2 of 3
+        # with docker-compose.kafka3.yml), and retries after a broker fails
+        # over neither duplicate nor reorder a ticker's ticks
+        "acks": "all",
+        "enable.idempotence": True,
     }
     producer = Producer(conf)
 

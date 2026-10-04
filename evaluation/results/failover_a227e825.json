@@ -1,0 +1,105 @@
+{
+  "node_stopped": "kafka3",
+  "outage_seconds": 118.3,
+  "node_rejoined_healthy_after_start_s": 35.4,
+  "live_run": {
+    "run_id": "a227e825",
+    "finished_utc": "2026-10-04T01:16:44+00:00",
+    "producer_start_utc_ms": 1791076229872,
+    "settings": {
+      "minutes": 6.0,
+      "speed": 100.0,
+      "warmup_sec": 60,
+      "consistency": "LOCAL_QUORUM"
+    },
+    "completeness": {
+      "produced_to_kafka": 40311,
+      "stored_raw_events": 40311,
+      "missing": 0,
+      "stored_anomalies": 1156
+    },
+    "rate_ticks_per_s": 112.2,
+    "latency_ms": {
+      "raw_events": {
+        "n": 40311,
+        "min": 575.4,
+        "p50": 2314.6,
+        "p95": 26909.9,
+        "p99": 29942.5,
+        "max": 32455.3,
+        "mean": 4938.5
+      },
+      "anomalies": {
+        "n": 1156,
+        "min": 1489.7,
+        "p50": 3407.9,
+        "p95": 28255.1,
+        "p99": 33051.7,
+        "max": 33555.3,
+        "mean": 6058.3
+      }
+    },
+    "latency_csv": "evaluation/results/live_a227e825_latency.csv"
+  },
+  "latency_by_phase_ms": {
+    "before": {
+      "ticks": 14576,
+      "p50": 3346.4,
+      "p95": 28948.0,
+      "p99": 31188.0,
+      "max": 32455.3
+    },
+    "during_outage": {
+      "ticks": 11026,
+      "p50": 1976.3,
+      "p95": 3204.3,
+      "p99": 3700.7,
+      "max": 4477.1
+    },
+    "after_restart": {
+      "ticks": 14709,
+      "p50": 2118.6,
+      "p95": 3535.2,
+      "p99": 4137.4,
+      "max": 4849.1
+    }
+  },
+  "probe": {
+    "before": {
+      "rf1": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      },
+      "rf3": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      }
+    },
+    "outage": {
+      "rf1": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      },
+      "rf3": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      }
+    },
+    "recovered": {
+      "rf1": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      },
+      "rf3": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      }
+    }
+  }
+}

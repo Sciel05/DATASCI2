@@ -51,6 +51,12 @@ kafka-topics.sh --create --topic market-ticks \
   --bootstrap-server localhost:9092
 ```
 
+(`--replication-factor 1` for a single local broker; on the 3-broker
+Docker stack leave it out to get the brokers' default of 3.) The producer
+sends with `acks=all` and idempotence: a tick counts as sent once every
+in-sync replica has it, and a retry neither duplicates nor reorders a
+ticker's ticks.
+
 ## Run it
 
 ```bash
