@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -806,6 +807,30 @@ def _add_ticker_panels(
 # ══════════════════════════════════════════════════════════════════
 # Section 1: Live Surveillance Desk Header & KPIs (Auto-Refresh Fragment)
 # ══════════════════════════════════════════════════════════════════
+def _latest_dispatch_line(log_path: str) -> str:
+    """One line on the alerting daemon's newest alert and its webhook
+    deliveries, from the last line of its audit log (persistence/alerts.log)."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 8192))
+            last = f.read().decode("utf-8", "replace").strip().splitlines()[-1]
+        alert = json.loads(last)
+    except (OSError, IndexError, ValueError):
+        return ("📣 Notifications: the alerting daemon hasn't dispatched an alert yet "
+                "(docker compose service `alerting`, or `python persistence/run_alerting.py --live`).")
+    when = pd.Timestamp(alert.get("created_at")).strftime("%H:%M:%S UTC")
+    deliveries = alert.get("deliveries") or {}
+    if deliveries:
+        sent = " · ".join(
+            f"{channel} {'✓' if outcome.startswith('ok') else '✗ ' + outcome}" for channel, outcome in deliveries.items()
+        )
+    else:
+        sent = "no webhook configured (console + audit log only)"
+    return (f"📣 Last alert dispatched {when}: {alert.get('severity')} {alert.get('ticker')} "
+            f"{alert.get('anomaly_type')} → {sent}")
+
+
 @st.fragment(run_every=refresh_interval if auto_refresh else None)
 def render_kpi_and_alerts():
     # Top Bar Header
@@ -1012,12 +1037,18 @@ def render_kpi_and_alerts():
     if critical_flags > 0:
         recent_crit = df_anomalies[df_anomalies["severity"] == "CRITICAL"].iloc[0]
         pattern_label = "Sudden Flash Price Drop" if (recent_crit["anomaly_type"] == "price_shock" and recent_crit["zscore"] < 0) else "Extreme Sudden Price Spike" if recent_crit["anomaly_type"] == "price_shock" else "Wash Trading (Fake Self-Trading)"
+        if recent_crit["anomaly_type"] == "wash_trade":
+            # a volume anomaly: say how far past its alarm level, not |z| of the price
+            crit_detail = (f"Volume far above normal with a flat price, <strong>{recent_crit['risk_score']:.1f}x "
+                           f"its alarm level</strong>")
+        else:
+            crit_detail = f"Price moved <strong>{abs(recent_crit['zscore']):.1f}x beyond normal boundaries</strong>"
         st.markdown(
             f"""
             <div class="critical-banner">
                 <strong>🔴 CRITICAL MARKET ALERT ({recent_crit['ticker']})</strong>: 
                 Severe <strong>{pattern_label}</strong> detected at <strong>${recent_crit['price']:.2f}</strong>. 
-                Price moved <strong>{abs(recent_crit['zscore']):.1f}x beyond normal boundaries</strong> at {recent_crit['event_time'].strftime('%H:%M:%S UTC')} 
+                {crit_detail} at {recent_crit['event_time'].strftime('%H:%M:%S UTC')} 
                 <span style="font-size: 0.8rem; opacity: 0.85;">(Risk: {recent_crit['risk_score']:.2f} · Signals: {recent_crit['signals'] or 'legacy'} · Peak Z-Score: {recent_crit['zscore']:+.2f} · VWAP Divergence: {recent_crit['vwap_divergence'] * 100:.2f}%)</span>.
             </div>
             """,
@@ -1047,6 +1078,7 @@ def render_kpi_and_alerts():
             """,
             unsafe_allow_html=True,
         )
+    st.caption(_latest_dispatch_line(cfg.alerts_log_path))
 
 
 # ══════════════════════════════════════════════════════════════════

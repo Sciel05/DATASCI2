@@ -1,9 +1,8 @@
 import json
 import logging
 import os
-import threading
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 import requests
 
@@ -22,16 +21,40 @@ class Notifier:
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
 
-    def notify(self, alert: Alert):
-        """Dispatch alert across all active notification channels."""
+    def notify(self, alert: Alert) -> Dict[str, str]:
+        """Dispatch alert across all active notification channels.
+
+        Webhooks are posted one after the other (at most 3 s each; alerts
+        are a few per minute) so their outcome can be checked and recorded:
+        it is printed, written into the alert's line in the audit log as
+        "deliveries" (the dashboard shows the latest), and returned as
+        {channel: "ok 204" | "failed: ..."}.
+        """
         self._notify_console(alert)
-        self._notify_log_file(alert)
-
+        deliveries = {}
         if self.config.discord_webhook_url:
-            threading.Thread(target=self._notify_discord, args=(alert,), daemon=True).start()
-
+            deliveries["discord"] = self._post("discord", self.config.discord_webhook_url, self._discord_payload(alert))
         if self.config.slack_webhook_url:
-            threading.Thread(target=self._notify_slack, args=(alert,), daemon=True).start()
+            deliveries["slack"] = self._post("slack", self.config.slack_webhook_url, self._slack_payload(alert))
+        for channel, outcome in deliveries.items():
+            print(f"           -> {channel} webhook: {outcome}")
+        self._notify_log_file(alert, deliveries)
+        return deliveries
+
+    @staticmethod
+    def _post(channel: str, url: str, payload: dict) -> str:
+        """POST a webhook and report the outcome. requests doesn't raise on
+        an HTTP error status, so a rejected webhook (wrong or revoked URL,
+        rate limit) has to be caught from the status code."""
+        try:
+            response = requests.post(url, json=payload, timeout=3.0)
+        except Exception as e:
+            logger.warning(f"{channel} webhook failed: {e}")
+            return f"failed: {type(e).__name__}"
+        if response.ok:
+            return f"ok {response.status_code}"
+        logger.warning(f"{channel} webhook rejected: HTTP {response.status_code} {response.text[:200]}")
+        return f"failed: HTTP {response.status_code}"
 
     def _notify_console(self, alert: Alert):
         colors = {
@@ -57,14 +80,15 @@ class Notifier:
             f"{ts_str}"
         )
 
-    def _notify_log_file(self, alert: Alert):
+    def _notify_log_file(self, alert: Alert, deliveries: Optional[Dict[str, str]] = None):
         try:
             with open(self.config.alerts_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(alert.to_dict()) + "\n")
+                f.write(json.dumps(dict(alert.to_dict(), deliveries=deliveries or {})) + "\n")
         except Exception as e:
             logger.error(f"Failed to append alert to log file {self.config.alerts_log_path}: {e}")
 
-    def _notify_discord(self, alert: Alert):
+    @staticmethod
+    def _discord_payload(alert: Alert) -> dict:
         color_hex = 15548997 if alert.severity == "CRITICAL" else 16766720
         payload = {
             "embeds": [
@@ -88,12 +112,10 @@ class Notifier:
                 }
             ]
         }
-        try:
-            requests.post(self.config.discord_webhook_url, json=payload, timeout=3.0)
-        except Exception as e:
-            logger.warning(f"Discord webhook failed: {e}")
+        return payload
 
-    def _notify_slack(self, alert: Alert):
+    @staticmethod
+    def _slack_payload(alert: Alert) -> dict:
         payload = {
             "text": f"*{alert.severity}*: {alert.message}",
             "blocks": [
@@ -106,7 +128,4 @@ class Notifier:
                 }
             ],
         }
-        try:
-            requests.post(self.config.slack_webhook_url, json=payload, timeout=3.0)
-        except Exception as e:
-            logger.warning(f"Slack webhook failed: {e}")
+        return payload

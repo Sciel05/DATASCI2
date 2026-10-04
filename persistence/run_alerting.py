@@ -12,7 +12,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from persistence.alerting.config import CONFIG, AlertConfig
-from persistence.alerting.alert_engine import AlertEngine
+from persistence.alerting.alert_engine import Alert, AlertEngine
 from persistence.alerting.notifier import Notifier
 from persistence.persistence_client import get_persistence_client
 
@@ -31,7 +31,12 @@ def main():
     parser.add_argument("--live", action="store_true", help="Connect to live Cassandra instead of mock")
     parser.add_argument("--interval", type=float, default=CONFIG.poll_interval_sec, help="Poll interval in seconds")
     parser.add_argument("--lookback", type=int, default=5, help="Lookback window in minutes for polling")
+    parser.add_argument("--test-webhook", action="store_true",
+                        help="Send one test alert to every configured webhook (DISCORD_WEBHOOK_URL, "
+                        "SLACK_WEBHOOK_URL), print the outcome and exit (1 if none is set or any failed)")
     args = parser.parse_args()
+    if args.test_webhook:
+        sys.exit(test_webhook())
 
     config = AlertConfig(
         use_mock=not args.live,
@@ -105,6 +110,25 @@ def main():
         time.sleep(sleep_time)
 
     print("[Alert Daemon] Stopped. Total incidents alerted:", total_alerts)
+
+def test_webhook() -> int:
+    """One clearly labeled test alert through the real Notifier, so a webhook
+    URL can be checked before a demo without waiting for a real anomaly."""
+    notifier = Notifier(config=CONFIG)
+    now = datetime.now(timezone.utc)
+    alert = Alert(
+        alert_id="webhook-test", ticker="TEST", severity="WARNING", anomaly_type="webhook_test",
+        start_time=now, end_time=now, peak_price=0.0, peak_zscore=0.0, peak_vwap_div=0.0,
+        total_volume=0.0, tick_count=0, signals="test",
+        message="[TEST] Market surveillance webhook check: if you can read this, alerts will arrive here.",
+    )
+    deliveries = notifier.notify(alert)
+    if not deliveries:
+        print("No webhook configured: set DISCORD_WEBHOOK_URL and/or SLACK_WEBHOOK_URL "
+              "(Docker stack: stream-processing/docker/.env, see .env.example).")
+        return 1
+    return 0 if all(v.startswith("ok") for v in deliveries.values()) else 1
+
 
 if __name__ == "__main__":
     main()

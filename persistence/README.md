@@ -246,7 +246,16 @@ python persistence/run_alerting.py --live
 python persistence/run_alerting.py --interval 2.0 --lookback 10
 ```
 
-Alerts are formatted to `stdout` and appended as structured JSON-lines records to `persistence/alerts.log`.
+Alerts are formatted to `stdout` and appended as structured JSON-lines records to `persistence/alerts.log`, each with the outcome of its webhook deliveries (`"deliveries": {"discord": "ok 204"}` or `"failed: HTTP 404"`). The dashboard shows the latest one under its alert banner ("📣 Last alert dispatched … → discord ✓").
+
+**Webhooks (Discord / Slack).** Set `DISCORD_WEBHOOK_URL` and/or `SLACK_WEBHOOK_URL`. In the Docker stack the `alerting` service runs the daemon (`--live`) and reads them from `stream-processing/docker/.env`: copy `.env.example` to `.env` (gitignored, never commit a webhook URL) and fill in the URL, then `docker compose up -d alerting`. Check the URL before a demo; this sends one clearly labeled test alert and exits 1 if no webhook is set or a delivery fails:
+
+```bash
+docker compose -f stream-processing/docker/docker-compose.yml exec alerting \
+    python3 persistence/run_alerting.py --test-webhook
+```
+
+A rejected webhook (wrong or revoked URL) is reported as `failed: HTTP <status>` in the daemon's output, the audit log and the dashboard line; it used to fail silently. Without a `.env`, alerts go to the console and the audit log only.
 
 ### 3. Refined detector directly to Cassandra
 

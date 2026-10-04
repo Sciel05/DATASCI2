@@ -107,6 +107,28 @@ services:
     stdin_open: true
     command: sleep infinity
 
+  # Alerting daemon (persistence/run_alerting.py --live): polls Cassandra,
+  # groups flags into incidents, prints them, appends persistence/alerts.log
+  # (the dashboard shows the latest dispatch from it) and posts them to the
+  # webhooks in ./.env (copy .env.example; no .env = console + log only).
+  # Check a webhook: docker compose exec alerting python3 persistence/run_alerting.py --test-webhook
+  alerting:
+    build: .
+    depends_on:
+      cassandra-init:
+        condition: service_completed_successfully
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CASSANDRA_HOST: cassandra1,cassandra2,cassandra3
+      CASSANDRA_CONSISTENCY: LOCAL_QUORUM
+    volumes:
+      - ../..:/workspace
+    working_dir: /workspace
+    command: python3 -u persistence/run_alerting.py --live
+    restart: unless-stopped
+
 volumes:
   cassandra1-data:
   cassandra2-data:
