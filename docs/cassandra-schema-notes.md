@@ -1,7 +1,9 @@
 # Cassandra schema notes for the stream-processing output
 
 This contract is now implemented by `persistence/schema.cql`,
-`persistence/cassandra_sink.py`, and the risk-aware alerting/dashboard client.
+`persistence/cassandra_sink.py`, and the risk-aware alerting/dashboard client,
+including the `(ticker, date)` partition key suggested below (as the
+column `day`; see "Suggested key").
 
 ## What arrives on the output topic
 
@@ -87,6 +89,13 @@ CREATE TABLE market_surveillance.tick_scores (
   same rows. (A message the producer itself sends twice is a different
   tick to the detector and gets the next `seq`.)
 - `date` isn't in the payload: derive it from `timestamp` in UTC.
+
+**As implemented** (`persistence/schema.cql`): both `raw_events` and
+`anomalies` use `PRIMARY KEY ((ticker, day), event_time, tick_id)`. The
+column is named `day` rather than `date` (also a CQL type name), and the
+clustering order is `event_time DESC` because the dashboard reads the
+newest rows first. On the labeled data the partitions measure exactly the
+range above (largest 11,765 rows: NVDA, 2026-09-21).
 
 If analysts mainly want alerts, a second table keyed by
 `((ticker, date), incident_id, event_time, tick_id)` holding only

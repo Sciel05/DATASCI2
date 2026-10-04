@@ -27,7 +27,9 @@ def detector_rows():
 
 
 def select(session, table, ticker):
-    return list(session.execute(f"SELECT * FROM {table} WHERE ticker = %s", (ticker,)))
+    """The ticker's rows in EVENT_TIME's (ticker, day) partition."""
+    return list(session.execute(f"SELECT * FROM {table} WHERE ticker = %s AND day = %s",
+                                (ticker, EVENT_TIME.date())))
 
 
 def test_batch_writes_all_ticks_and_only_flagged_anomalies(spark, cassandra_session):
@@ -44,11 +46,14 @@ def test_batch_writes_all_ticks_and_only_flagged_anomalies(spark, cassandra_sess
     assert [(r.tick_id, r.price, r.volume) for r in raw_b1] == [(f"PYTEST_B1-{MS}-0", 251.50, 500.0)]
     assert [(r.tick_id, r.price, r.volume) for r in raw_b2] == [(f"PYTEST_B2-{MS}-0", 420.10, 200.0)]
     assert raw_b1[0].event_time == EVENT_TIME.replace(tzinfo=None)
+    # the sink derives the day partition from the UTC event time
+    assert raw_b1[0].day.date() == EVENT_TIME.date()
 
     anomalies = select(cassandra_session, "anomalies", "PYTEST_B1")
     assert len(anomalies) == 1
     a = anomalies[0]
     assert a.event_time == EVENT_TIME.replace(tzinfo=None)
+    assert a.day.date() == EVENT_TIME.date()
     assert a.tick_id == f"PYTEST_B1-{MS}-0"
     assert (a.price, a.volume, a.zscore, a.vwap_divergence) == (251.50, 500.0, 4.21, 0.037)
     assert (a.ewma_divergence, a.cusum_price, a.cusum_volume, a.risk_score) == (2.8, 6.2, 0.0, 1.35)

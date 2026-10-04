@@ -126,6 +126,15 @@ python -m pip install -r persistence/requirements.txt
 
 ## Database Setup (Apache Cassandra)
 
+> **Upgrading from before 2026-10-04 (teammates and coding agents):** both
+> tables are now partitioned by `(ticker, day)`. A keyspace created earlier
+> must be recreated, which **deletes its data** (replayable test data):
+> `python -m persistence.schema_tools --reset` from the repo root. Until
+> then the detector stops at start-up ("raw_events is missing ['day']") and the
+> dashboard can't connect ("Undefined column name day"). Don't revert the
+> key or add `ALLOW FILTERING` to get around it. Details below and at the
+> top of `persistence/schema.cql`.
+
 ### 1. Keyspace & Table Schema (`persistence/schema.cql`)
 
 ```sql
@@ -140,17 +149,19 @@ USE surveillance;
 -- All processed market events
 CREATE TABLE IF NOT EXISTS raw_events (
     ticker text,
+    day date,              -- UTC date of event_time, written by the sink
     event_time timestamp,
     tick_id text,
     price double,
     volume double,
     side text,
-    PRIMARY KEY ((ticker), event_time, tick_id)
+    PRIMARY KEY ((ticker, day), event_time, tick_id)
 ) WITH CLUSTERING ORDER BY (event_time DESC, tick_id ASC);
 
 -- Detected statistical anomalies
 CREATE TABLE IF NOT EXISTS anomalies (
     ticker text,
+    day date,
     event_time timestamp,
     tick_id text,
     price double,
@@ -165,13 +176,17 @@ CREATE TABLE IF NOT EXISTS anomalies (
     risk_score double,
     signals text,
     incident_id text,
-    PRIMARY KEY ((ticker), event_time, tick_id)
+    PRIMARY KEY ((ticker, day), event_time, tick_id)
 ) WITH CLUSTERING ORDER BY (event_time DESC, tick_id ASC);
 ```
 
-Both tables use `ticker` as the partition key and `(event_time, tick_id)` as clustering keys. The deterministic `tick_id` preserves distinct ticks in the same millisecond and makes Spark micro-batch retries idempotent. Queries remain partition-scoped and time ordered without `ALLOW FILTERING`.
+Both tables are partitioned by **`(ticker, day)`**, one partition per ticker per UTC day, with `(event_time, tick_id)` as clustering keys, newest first. `day` is the UTC date of `event_time`; the sink derives it, and a US session (13:30–20:00 UTC) never crosses UTC midnight, so a ticker's trading day is exactly one partition.
 
-The primary key changed from the original schema, and `schema.cql` only uses `CREATE ... IF NOT EXISTS`, so re-applying it keeps an older table as it is. `detect_anomalies.py --cassandra-sink` therefore checks the tables' columns before it starts and stops with a message naming what is missing. To recreate the keyspace (this deletes its data; Cassandra cannot alter primary-key columns in place):
+- **Why not `((ticker))`:** a ticker's partition would hold its whole history and grow without bound, as would the load on the nodes that own it. With a day in the key a partition stops growing at the end of its day: on the labeled data the largest is 11,765 rows (NVDA, 2026-09-21) instead of 51,593 for all of NVDA's ticks, and the 5 partitions become 25. In production, with millions of ticks per ticker per day, the same idea extends to an hour bucket.
+- **Reads name the day(s).** A query must give the whole partition key, so the dashboard client reads a time window as one query per UTC day it covers, usually just today (`persistence_client.py`; `persistence/test_day_partitions.py` checks a window across midnight). Finding a ticker's newest data when the window is empty uses `SELECT DISTINCT ticker, day`, which reads only the partition index, cached for 30 s.
+- The deterministic `tick_id` preserves distinct ticks in the same millisecond and makes Spark micro-batch retries idempotent. Queries stay partition-scoped and time ordered, without `ALLOW FILTERING`.
+
+The primary key changed from the original schema (twice: `tick_id` was added, then `day`), and `schema.cql` only uses `CREATE ... IF NOT EXISTS`, so re-applying it keeps an older table as it is. `detect_anomalies.py --cassandra-sink` therefore checks the tables' columns before it starts and stops with a message naming what is missing. To recreate the keyspace (this deletes its data; Cassandra cannot alter primary-key columns in place):
 
 ```bash
 python -m persistence.schema_tools --reset    # from the repo root; --check only checks
@@ -281,7 +296,7 @@ End to end (producer -> Kafka -> detector `--cassandra-sink` -> Cassandra, compa
 ## Key Architecture & Design Highlights
 
 1. **Partition-Scoped Cassandra Queries:**
-   Instead of cluster-wide table scans (`SELECT * FROM anomalies WHERE event_time >= ? ALLOW FILTERING`), queries are strictly partitioned by ticker (`WHERE ticker = ? AND event_time >= ? LIMIT N`). This ensures constant $O(1)$ partition retrieval time even as the database scales to millions of records.
+   Instead of cluster-wide table scans (`SELECT * FROM anomalies WHERE event_time >= ? ALLOW FILTERING`), every query names one `(ticker, day)` partition (`WHERE ticker = ? AND day = ? AND event_time >= ? LIMIT N`), one per UTC day the window covers. Each read touches a single bounded partition, however much history the table holds.
 2. **Burst Debouncing / Incident Aggregation:**
    High-frequency streaming can flag dozens of consecutive ticks during a single price shock. Refined rows are grouped by Objective 2's stable `incident_id`; legacy rows retain Kyle's configurable time-window fallback. Peak risk and fired signals are preserved while preventing alert fatigue.
 3. **End-to-End Latency Tracking for Objective 4:**

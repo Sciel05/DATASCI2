@@ -12,6 +12,22 @@ from .alerting.config import CONFIG, AlertConfig
 from .schema_tools import cluster as make_cluster
 
 
+def _utc_days(start: datetime, end: datetime) -> List:
+    """The UTC dates from start's to end's, inclusive: the (ticker, day)
+    partitions a time window covers (schema.cql)."""
+    day, last = start.astimezone(timezone.utc).date(), end.astimezone(timezone.utc).date()
+    days = []
+    while day <= last:
+        days.append(day)
+        day += timedelta(days=1)
+    return days
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """The driver returns naive UTC datetimes."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 ANOMALY_COLUMNS = [
     "ticker",
     "event_time",
@@ -104,8 +120,9 @@ class CassandraClient(PersistenceClient):
             except Exception:
                 pass
 
-            # Query is scoped to partition key (ticker) to avoid cluster-wide table scans
-            # and avoid requiring ALLOW FILTERING in Cassandra.
+            # Every query names a whole partition key (ticker, day), so it reads
+            # one partition: no cluster-wide scan, no ALLOW FILTERING. A time
+            # window is read as one query per UTC day it covers.
             self._selected_anomaly_columns = [
                 name for name in ANOMALY_COLUMNS if name in available_columns
             ]
@@ -113,16 +130,29 @@ class CassandraClient(PersistenceClient):
             query = f"""
                 SELECT {selected}
                 FROM anomalies
-                WHERE ticker = ? AND event_time >= ?
+                WHERE ticker = ? AND day = ? AND event_time >= ?
                 ORDER BY event_time DESC
                 LIMIT ?
             """
             self._prepared_stmt = self._session.prepare(query)
-            self._stmt_latest_anom = self._session.prepare("SELECT event_time FROM anomalies WHERE ticker = ? LIMIT 1")
-            self._stmt_latest_raw = self._session.prepare("SELECT event_time FROM raw_events WHERE ticker = ? LIMIT 1")
+            self._stmt_raw_since = self._session.prepare(
+                "SELECT event_time, price, volume FROM raw_events "
+                "WHERE ticker = ? AND day = ? AND event_time >= ? ORDER BY event_time ASC"
+            )
+            self._stmt_latest = {
+                table: self._session.prepare(f"SELECT event_time FROM {table} WHERE ticker = ? AND day = ? LIMIT 1")
+                for table in ("anomalies", "raw_events")
+            }
+            self._latest_days = {}
         except Exception as e:
             self._session = None
-            raise ConnectionError(f"Failed to connect to Cassandra at {self.config.cassandra_host}:{self.config.cassandra_port}: {e}")
+            hint = ""
+            if "day" in str(e):
+                # a keyspace created before the ((ticker, day)) partition key
+                hint = (" -- the tables predate the 2026-10-04 ((ticker, day)) partition key; recreate them "
+                        "(deletes their data) with: python -m persistence.schema_tools --reset "
+                        "(note at the top of persistence/schema.cql)")
+            raise ConnectionError(f"Failed to connect to Cassandra at {self.config.cassandra_host}:{self.config.cassandra_port}: {e}{hint}")
 
     def fetch_recent_anomalies(
         self,
@@ -133,19 +163,18 @@ class CassandraClient(PersistenceClient):
         if not self._session:
             self._connect()
 
-        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+        now = datetime.now(timezone.utc)
+        cutoff_time = now - timedelta(minutes=lookback_minutes)
         tickers_to_query = [ticker] if ticker else list(self.config.monitored_tickers)
 
         records = []
         for sym in tickers_to_query:
-            rows = list(self._session.execute(self._prepared_stmt, (sym, cutoff_time, limit)))
-            if not rows and self._stmt_latest_anom:
-                latest_row = self._session.execute(self._stmt_latest_anom, (sym,)).one()
-                if latest_row and latest_row.event_time:
-                    latest_dt = latest_row.event_time if latest_row.event_time.tzinfo else latest_row.event_time.replace(tzinfo=timezone.utc)
-                    if latest_dt < cutoff_time:
-                        adjusted_cutoff = latest_dt - timedelta(minutes=lookback_minutes)
-                        rows = list(self._session.execute(self._prepared_stmt, (sym, adjusted_cutoff, limit)))
+            rows = self._anomalies_since(sym, cutoff_time, now, limit)
+            if not rows:
+                latest_dt = self._latest_event_time("anomalies", sym)
+                if latest_dt and latest_dt < cutoff_time:
+                    adjusted_cutoff = latest_dt - timedelta(minutes=lookback_minutes)
+                    rows = self._anomalies_since(sym, adjusted_cutoff, latest_dt, limit)
             for row in rows:
                 zscore = _finite_float(getattr(row, "zscore", 0.0))
                 vwap_divergence = _finite_float(getattr(row, "vwap_divergence", 0.0))
@@ -229,6 +258,48 @@ class CassandraClient(PersistenceClient):
                 "latency_ms": -1.0,
             }
 
+    def _anomalies_since(self, sym, cutoff, end, limit):
+        """Newest-first anomaly rows at or after cutoff, from the day
+        partitions up to end's, newest day first, stopping at limit."""
+        rows = []
+        for day in reversed(_utc_days(cutoff, end)):
+            rows += self._session.execute(self._prepared_stmt, (sym, day, cutoff, limit - len(rows)))
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def _latest_event_time(self, table, sym):
+        """The ticker's newest event_time in table, or None: its newest day
+        partition, then that partition's first (newest) row."""
+        day = self._latest_day(table, sym)
+        if day is None:
+            return None
+        row = self._session.execute(self._stmt_latest[table], (sym, day)).one()
+        return _as_utc(row.event_time) if row and row.event_time else None
+
+    def _latest_day(self, table, sym, max_age_s=30.0):
+        """The ticker's newest day partition in table. Listed from the
+        partition keys alone (SELECT DISTINCT reads the partition index,
+        not the rows) and cached for max_age_s; only the fallback for an
+        empty lookback window needs it."""
+        fetched_at, latest = self._latest_days.get(table, (0.0, {}))
+        if time.monotonic() - fetched_at > max_age_s:
+            latest = {}
+            for r in self._session.execute(f"SELECT DISTINCT ticker, day FROM {table}"):
+                day = r.day.date()  # cassandra.util.Date -> datetime.date
+                if r.ticker not in latest or day > latest[r.ticker]:
+                    latest[r.ticker] = day
+            self._latest_days[table] = (time.monotonic(), latest)
+        return latest.get(sym)
+
+    def _raw_since(self, ticker, cutoff, end):
+        """Oldest-first raw_events rows at or after cutoff, from the day
+        partitions up to end's, oldest day first."""
+        rows = []
+        for day in _utc_days(cutoff, end):
+            rows += self._session.execute(self._stmt_raw_since, (ticker, day, cutoff))
+        return rows
+
     def fetch_recent_ohlc(
         self,
         ticker: str,
@@ -238,19 +309,14 @@ class CassandraClient(PersistenceClient):
         if not self._session:
             self._connect()
 
-        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
-        query = self._session.prepare(
-            "SELECT event_time, price, volume FROM raw_events "
-            "WHERE ticker = ? AND event_time >= ? ORDER BY event_time ASC"
-        )
-        rows = list(self._session.execute(query, (ticker, cutoff_time)))
-        if not rows and self._stmt_latest_raw:
-            latest_row = self._session.execute(self._stmt_latest_raw, (ticker,)).one()
-            if latest_row and latest_row.event_time:
-                latest_dt = latest_row.event_time if latest_row.event_time.tzinfo else latest_row.event_time.replace(tzinfo=timezone.utc)
-                if latest_dt < cutoff_time:
-                    adjusted_cutoff = latest_dt - timedelta(minutes=lookback_minutes)
-                    rows = list(self._session.execute(query, (ticker, adjusted_cutoff)))
+        now = datetime.now(timezone.utc)
+        cutoff_time = now - timedelta(minutes=lookback_minutes)
+        rows = self._raw_since(ticker, cutoff_time, now)
+        if not rows:
+            latest_dt = self._latest_event_time("raw_events", ticker)
+            if latest_dt and latest_dt < cutoff_time:
+                adjusted_cutoff = latest_dt - timedelta(minutes=lookback_minutes)
+                rows = self._raw_since(ticker, adjusted_cutoff, latest_dt)
 
         records = [
             {"event_time": row.event_time, "price": float(row.price), "volume": float(row.volume)}

@@ -9,18 +9,18 @@ def test_anomaly_round_trip(cassandra_session):
     cassandra_session.execute(
         """
         INSERT INTO anomalies (
-            ticker, event_time, tick_id, price, volume, zscore, vwap_divergence,
+            ticker, day, event_time, tick_id, price, volume, zscore, vwap_divergence,
             is_anomaly, anomaly_type, risk_score, signals, incident_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
-            "PYTEST_A", event_time, tick_id, 180.25, 5000.0, 4.21, 0.037,
+            "PYTEST_A", event_time.date(), event_time, tick_id, 180.25, 5000.0, 4.21, 0.037,
             True, "price_shock", 1.25, "vwap", "PYTEST_A-1789569000123",
         ),
     )
 
     rows = list(cassandra_session.execute(
-        "SELECT * FROM anomalies WHERE ticker = %s", ("PYTEST_A",)
+        "SELECT * FROM anomalies WHERE ticker = %s AND day = %s", ("PYTEST_A", event_time.date())
     ))
 
     assert len(rows) == 1

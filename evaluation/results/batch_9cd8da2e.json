@@ -1,0 +1,98 @@
+{
+  "run_id": "9cd8da2e",
+  "finished_utc": "2026-10-04T01:53:45+00:00",
+  "dataset": {
+    "file": "aapl_msft_googl_tsla_nvda_ticks_labeled.csv",
+    "ticks": 140751,
+    "labels": {
+      "normal": 139575,
+      "wash_trade": 595,
+      "price_shock": 581
+    }
+  },
+  "completeness": {
+    "produced_to_kafka": 140751,
+    "stored_raw_events": 140751,
+    "missing_from_cassandra": 0,
+    "not_in_dataset": 0,
+    "stored_anomalies": 4274,
+    "detector_notes": []
+  },
+  "throughput": {
+    "producer_to_kafka_msgs_per_s": 3506.1,
+    "producer_seconds": 40.1,
+    "max_offsets_per_trigger": 10000,
+    "spark_job_wall_s": 235.6,
+    "detector_and_sink_rows_per_s": 1063.2,
+    "first_to_last_cassandra_write_s": 132.4
+  },
+  "accuracy": {
+    "flags": 4274,
+    "flags_without_matching_tick": 0,
+    "labeled_events": {
+      "wash_trade": 595,
+      "price_shock": 581
+    },
+    "any": {
+      "tick": {
+        "precision": 0.2211,
+        "recall": 0.8036,
+        "f1": 0.3468,
+        "flags": 4274
+      },
+      "event": {
+        "precision": 0.8374,
+        "recall": 0.9371,
+        "f1": 0.8844,
+        "events_found": 1102,
+        "events": 1176
+      },
+      "incident": {
+        "precision": 0.7573,
+        "incidents": 1335,
+        "true_incidents": 1011
+      }
+    },
+    "price_shock": {
+      "tick": {
+        "precision": 0.3862,
+        "recall": 0.8761,
+        "f1": 0.5361,
+        "flags": 1318
+      },
+      "event": {
+        "precision": 0.4985,
+        "recall": 0.8761,
+        "f1": 0.6354,
+        "events_found": 509,
+        "events": 581
+      },
+      "incident": {
+        "precision": 0.543,
+        "incidents": 895,
+        "true_incidents": 486
+      }
+    },
+    "wash_trade": {
+      "tick": {
+        "precision": 0.1461,
+        "recall": 0.7261,
+        "f1": 0.2433,
+        "flags": 2956
+      },
+      "event": {
+        "precision": 0.9354,
+        "recall": 0.9933,
+        "f1": 0.9635,
+        "events_found": 591,
+        "events": 595
+      },
+      "incident": {
+        "precision": 0.8121,
+        "incidents": 697,
+        "true_incidents": 566
+      }
+    }
+  },
+  "end_to_end_wall_s": 283.9
+}

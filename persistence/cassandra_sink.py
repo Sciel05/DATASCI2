@@ -78,9 +78,11 @@ def prepare_detector_output(batch_df):
 
 
 def _cassandra_values(row, columns):
-    """Build driver values without passing timezone-naive Spark datetimes."""
+    """Build driver values without passing timezone-naive Spark datetimes,
+    followed by the row's ``day`` partition (the UTC date of event_time)."""
     event_time = datetime.fromtimestamp(row["_event_time_ms"] / 1000.0, timezone.utc)
-    return tuple(event_time if name == "event_time" else row[name] for name in columns)
+    values = tuple(event_time if name == "event_time" else row[name] for name in columns)
+    return values + (event_time.date(),)
 
 
 # Inserts in flight at once per partition, and the per-insert timeout. One
@@ -169,9 +171,9 @@ def write_anomalies_to_cassandra(batch_df, batch_id):
                 ticker, event_time, tick_id, price, volume,
                 zscore, vwap_divergence, is_anomaly, anomaly_type,
                 ewma_divergence, cusum_price, cusum_volume,
-                risk_score, signals, incident_id
+                risk_score, signals, incident_id, day
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         )
         _execute_all(
@@ -201,8 +203,8 @@ def write_raw_events_to_cassandra(batch_df, batch_id):
         session = _session()
         insert_statement = session.prepare(
             """
-            INSERT INTO raw_events (ticker, event_time, tick_id, price, volume)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO raw_events (ticker, event_time, tick_id, price, volume, day)
+            VALUES (?, ?, ?, ?, ?, ?)
             """
         )
         _execute_all(

@@ -35,13 +35,18 @@ REPLICATION_RE = re.compile(r"'(\w+)'\s*:\s*(\d+)\s*}")
 
 # Columns the sink writes to each table (cassandra_sink.py).
 REQUIRED_COLUMNS = {
-    "raw_events": {"ticker", "event_time", "tick_id", "price", "volume"},
+    "raw_events": {"ticker", "day", "event_time", "tick_id", "price", "volume"},
     "anomalies": {
-        "ticker", "event_time", "tick_id", "price", "volume", "zscore",
+        "ticker", "day", "event_time", "tick_id", "price", "volume", "zscore",
         "vwap_divergence", "is_anomaly", "anomaly_type", "ewma_divergence",
         "cusum_price", "cusum_volume", "risk_score", "signals", "incident_id",
     },
 }
+
+
+# Both tables' partition key. A primary key can't be altered, so a table
+# created with the old ((ticker)) key has to be recreated (--reset).
+PARTITION_KEY = {"ticker", "day"}
 
 
 class SchemaMismatch(RuntimeError):
@@ -49,8 +54,10 @@ class SchemaMismatch(RuntimeError):
 
 
 def schema_statements(keyspace=SCHEMA_KEYSPACE):
-    """The statements in schema.cql, with the keyspace name replaced."""
-    text = SCHEMA_PATH.read_text(encoding="utf-8")
+    """The statements in schema.cql, with the keyspace name replaced.
+    Comments are dropped first, so a ';' inside one can't split a statement
+    (schema.cql has no string literals containing '--')."""
+    text = re.sub(r"--[^\n]*", "", SCHEMA_PATH.read_text(encoding="utf-8"))
     if keyspace != SCHEMA_KEYSPACE:
         text = re.sub(rf"\b{SCHEMA_KEYSPACE}\b", keyspace, text)
     return [s.strip() for s in text.split(";") if s.strip()]
@@ -91,21 +98,31 @@ def verify_schema(session, keyspace=SCHEMA_KEYSPACE):
     """Raise SchemaMismatch if a table the sink writes is missing columns."""
     problems = []
     for table, required in REQUIRED_COLUMNS.items():
-        rows = session.execute(
-            "SELECT column_name FROM system_schema.columns "
+        rows = list(session.execute(
+            "SELECT column_name, kind FROM system_schema.columns "
             "WHERE keyspace_name = %s AND table_name = %s",
             (keyspace, table),
-        )
+        ))
         present = {r.column_name for r in rows}
+        partition_key = {r.column_name for r in rows if r.kind == "partition_key"}
         if not present:
             problems.append(f"table {keyspace}.{table} does not exist")
         elif required - present:
             problems.append(f"{keyspace}.{table} is missing {sorted(required - present)}")
+        elif partition_key != PARTITION_KEY:
+            problems.append(f"{keyspace}.{table} is partitioned by {sorted(partition_key)}, "
+                            f"not {sorted(PARTITION_KEY)}")
     if problems:
+        hint = (
+            " The tables were created before the 2026-10-04 change to the "
+            "((ticker, day)) partition key (see the note at the top of schema.cql)."
+            if any("partitioned by" in p or "missing ['day']" in p for p in problems) else ""
+        )
         raise SchemaMismatch(
             "Cassandra schema does not match persistence/schema.cql: "
             + "; ".join(problems)
-            + ". Recreate it with: python -m persistence.schema_tools --reset"
+            + "." + hint
+            + " Recreate it (this deletes the keyspace's data) with: python -m persistence.schema_tools --reset"
         )
 
 

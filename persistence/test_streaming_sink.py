@@ -82,18 +82,18 @@ def test_stream_persists_every_tick_across_micro_batches(spark, cassandra_sessio
     # One micro-batch per file, so the sink ran across batch boundaries.
     assert batches == [TICKS_PER_FILE] * N_FILES
 
-    stored_raw = {
-        r.tick_id: (r.price, r.volume)
-        for ticker in ("PYTEST_S1", "PYTEST_S2")
-        for r in cassandra_session.execute("SELECT * FROM raw_events WHERE ticker = %s", (ticker,))
-    }
+    def stored(table):
+        return [
+            r
+            for ticker in ("PYTEST_S1", "PYTEST_S2")
+            for r in cassandra_session.execute(
+                f"SELECT * FROM {table} WHERE ticker = %s AND day = %s", (ticker, START.date()))
+        ]
+
+    stored_raw = {r.tick_id: (r.price, r.volume) for r in stored("raw_events")}
     assert stored_raw == {t["tick_id"]: (t["price"], t["volume"]) for t in ticks}
 
-    stored_anomalies = {
-        r.tick_id: (r.anomaly_type, r.zscore, r.incident_id)
-        for ticker in ("PYTEST_S1", "PYTEST_S2")
-        for r in cassandra_session.execute("SELECT * FROM anomalies WHERE ticker = %s", (ticker,))
-    }
+    stored_anomalies = {r.tick_id: (r.anomaly_type, r.zscore, r.incident_id) for r in stored("anomalies")}
     assert stored_anomalies == {
         t["tick_id"]: (t["anomaly_type"], t["zscore"], t["incident_id"])
         for t in ticks if t["is_anomaly"]

@@ -51,7 +51,6 @@ DETECTOR = ROOT / "stream-processing" / "detect_anomalies.py"
 RESULTS = Path(__file__).resolve().parent / "results"
 KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0"
 DEFAULT_SPARK_SUBMIT = "/usr/local/lib/python3.10/dist-packages/pyspark/bin/spark-submit"
-TICKERS = ("AAPL", "GOOGL", "MSFT", "NVDA", "TSLA")
 PARTITIONS = 8
 
 # inject_anomalies.py labels only an event's first tick, but a price shock
@@ -107,12 +106,15 @@ def detector_cmd(topic, checkpoint, extra=()):
 
 
 def read_table(session, keyspace, table, columns):
-    """Every row of a table, one partition (ticker) at a time, with the
-    write time of its price cell in epoch ms."""
+    """Every row of a table, one (ticker, day) partition at a time, with the
+    write time of its price cell in epoch ms. The partitions are listed from
+    the partition keys alone (SELECT DISTINCT)."""
     rows = []
-    for ticker in TICKERS:
+    partitions = session.execute(f"SELECT DISTINCT ticker, day FROM {keyspace}.{table}")
+    for p in sorted(partitions, key=lambda p: (p.ticker, p.day.days_from_epoch)):
         rows += session.execute(
-            f"SELECT {columns}, writetime(price) AS wt_us FROM {keyspace}.{table} WHERE ticker = %s", (ticker,))
+            f"SELECT {columns}, writetime(price) AS wt_us FROM {keyspace}.{table} "
+            "WHERE ticker = %s AND day = %s", (p.ticker, p.day))
     out = pd.DataFrame([r._asdict() for r in rows])
     if out.empty:
         return out
