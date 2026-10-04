@@ -15,7 +15,7 @@ Pelayo, Agatha Fei · Narciso, Frank Exequiel · Gomugda, Kyle Joniel
 | 1 | Event Ingestion & Partitioning | Pelayo, Agatha Fei | Done — see `data-ingestion/` |
 | 2 | Real-Time Stream Processing & Detection | Narciso, Frank Exequiel | Refined detector implemented — see `stream-processing/` |
 | 3 | Distributed Persistence & Alerting | Villanueva, Hector Angelo & Gomugda, Kyle Joniel | Synchronized dashboard & persistence verified — see `persistence/` |
-| 4 | Pipeline Integration & Evaluation | Catacutan, Elijah | Objective 2/3 integration verified; evaluation pending — see `evaluation/` |
+| 4 | Pipeline Integration & Evaluation | Catacutan, Elijah | End-to-end evaluation on a 3-node Cassandra cluster done (completeness, accuracy, throughput, latency, node failure); recorded demo run pending — see `evaluation/` |
 
 ## Repo structure
 
@@ -30,7 +30,7 @@ market-surveillance-pipeline/
 - `data-ingestion/`: Working Kafka producer with synthetic & labeled market tick generation.
 - `stream-processing/`: Spark Structured Streaming detection pipeline (Z-score, VWAP divergence).
 - `persistence/`: Apache Cassandra schema + streaming sinks (`cassandra_sink.py`), plus real-time alerting engine (`alerting/`), background daemon (`run_alerting.py`), and Streamlit financial surveillance desk (`dashboard/app.py`).
-- `evaluation/`: End-to-end evaluation metrics (precision, recall, latency).
+- `evaluation/`: End-to-end evaluation (`run_evaluation.py`, `failover_drill.py`) and results: completeness, precision/recall, throughput, latency, node failure.
 
 ## Architecture
 
@@ -38,7 +38,7 @@ market-surveillance-pipeline/
 [yfinance real bars] -> [tick upsampling + anomaly injection]
         -> [Kafka: market-ticks topic, partitioned by ticker]
         -> [Spark Structured Streaming: per-ticker rolling Z-score / VWAP]
-        -> [Cassandra: raw_events + anomalies tables]
+        -> [Cassandra, 3 nodes, RF=3, LOCAL_QUORUM: raw_events + anomalies tables]
         -> [Alerting Daemon + Streamlit Surveillance Dashboard]
 ```
 

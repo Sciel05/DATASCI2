@@ -1,0 +1,105 @@
+{
+  "node_stopped": "cassandra3",
+  "outage_seconds": 119.2,
+  "node_rejoined_healthy_after_start_s": 34.3,
+  "live_run": {
+    "run_id": "368cb371",
+    "finished_utc": "2026-10-03T23:59:03+00:00",
+    "producer_start_utc_ms": 1791071567912,
+    "settings": {
+      "minutes": 6.0,
+      "speed": 100.0,
+      "warmup_sec": 60,
+      "consistency": "LOCAL_QUORUM"
+    },
+    "completeness": {
+      "produced_to_kafka": 40271,
+      "stored_raw_events": 40271,
+      "missing": 0,
+      "stored_anomalies": 1153
+    },
+    "rate_ticks_per_s": 112.3,
+    "latency_ms": {
+      "raw_events": {
+        "n": 40271,
+        "min": 529.5,
+        "p50": 2039.0,
+        "p95": 26088.8,
+        "p99": 28905.5,
+        "max": 31136.8,
+        "mean": 4521.3
+      },
+      "anomalies": {
+        "n": 1153,
+        "min": 1216.0,
+        "p50": 2767.1,
+        "p95": 29742.4,
+        "p99": 32998.3,
+        "max": 33227.9,
+        "mean": 5464.5
+      }
+    },
+    "latency_csv": "evaluation/results/live_368cb371_latency.csv"
+  },
+  "latency_by_phase_ms": {
+    "before": {
+      "ticks": 14483,
+      "p50": 2941.4,
+      "p95": 28105.0,
+      "p99": 29959.6,
+      "max": 31136.8
+    },
+    "during_outage": {
+      "ticks": 11119,
+      "p50": 1700.9,
+      "p95": 2654.6,
+      "p99": 3005.7,
+      "max": 3478.2
+    },
+    "after_restart": {
+      "ticks": 14669,
+      "p50": 1896.9,
+      "p95": 3131.4,
+      "p99": 3675.4,
+      "max": 4655.0
+    }
+  },
+  "probe": {
+    "before": {
+      "rf1": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      },
+      "rf3": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      }
+    },
+    "outage": {
+      "rf1": {
+        "keys": 200,
+        "write_failures": 82,
+        "read_failures": 0
+      },
+      "rf3": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      }
+    },
+    "recovered": {
+      "rf1": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      },
+      "rf3": {
+        "keys": 200,
+        "write_failures": 0,
+        "read_failures": 0
+      }
+    }
+  }
+}
