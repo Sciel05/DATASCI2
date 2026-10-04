@@ -83,6 +83,21 @@ Each run reads the whole topic from the beginning and stops at its end
 exits 1 if it finds a violation. Add `--follow` to keep checking while
 `producer.py` is still sending; `--max-messages N` checks only the first N.
 
+**For the demo, `--watch`**: the same check as a live screen, redrawn every
+second, with one row per partition (its tickers, the broker leading it,
+messages checked, newest event time, violations) under a green
+**ORDER HOLDS: 0 violations in N messages** (red **ORDER VIOLATED** if
+one appears). Run it next to the producer, in the Docker stack:
+
+```bash
+docker compose -f stream-processing/docker/docker-compose.yml exec pyspark \
+    python3 data-ingestion/verify_consumer.py --bootstrap-servers kafka:9092 --watch
+```
+
+With the 3-broker stack (add `-f docker-compose.kafka3.yml`), stopping a
+broker during the demo shows the leader column move to the other brokers
+while the status stays ORDER HOLDS. Ctrl+C stops it with the summary.
+
 ## Files
 
 | File | Purpose |
