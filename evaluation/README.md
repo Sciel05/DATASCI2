@@ -49,7 +49,8 @@ Dataset: `aapl_msft_googl_tsla_nvda_ticks_labeled.csv`, 140,751 ticks over
 
 ## Results
 
-Runs: batch `35eae9d1`, failover drill `368cb371`
+Runs (1 Kafka broker): batch `35eae9d1`, failover drill `368cb371`;
+accuracy after the price-shock tuning: batch `8c710e02`
 (`evaluation/results/`).
 
 ### 1. Completeness — no tick lost
@@ -63,7 +64,7 @@ Every stored tick also matches a dataset tick (no duplicates or strays): the
 sink's writes are idempotent (`tick_id` is part of the primary key), so a
 replayed micro-batch overwrites instead of duplicating.
 
-### 2. Detection accuracy (batch run)
+### 2. Detection accuracy (batch run, tuned price-shock thresholds)
 
 `inject_anomalies.py` labels only the **first** tick of an injected event,
 but a price shock decays over the next 5 ticks and a wash-trade burst lasts
@@ -79,22 +80,37 @@ accuracy is reported at three levels:
 
 | | Event precision | Event recall | Event F1 | Incident precision | Tick precision / recall |
 |---|---|---|---|---|---|
-| **Any anomaly** | 0.78 | 0.72 (844 / 1,176) | 0.75 | 0.72 (795 / 1,103) | 0.16 / 0.58 |
-| `wash_trade` | **0.94** | **0.99** (590 / 595) | **0.96** | 0.81 (567 / 698) | 0.15 / 0.73 |
-| `price_shock` | 0.34 | 0.43 (249 / 581) | 0.38 | 0.48 (247 / 514) | 0.20 / 0.42 |
+| **Any anomaly** | 0.84 | **0.94** (1,102 / 1,176) | **0.88** | 0.76 (1,011 / 1,335) | 0.22 / 0.80 |
+| `wash_trade` | **0.94** | **0.99** (591 / 595) | **0.96** | 0.81 (566 / 697) | 0.15 / 0.73 |
+| `price_shock` | 0.50 | **0.88** (509 / 581) | 0.64 | 0.54 (486 / 895) | 0.39 / 0.88 |
 
-- **Wash trades are detected almost perfectly**: 590 of 595 events, and 94%
-  of wash-trade flags are inside a real wash-trade burst.
-- **Price shocks are the weak spot**: under half the injected shocks are
-  typed as `price_shock`, and two thirds of `price_shock` flags fall outside
-  a shock window. The injected shocks are 4–8 local sigma and decay within
-  5 ticks, so on volatile tickers they sit close to normal noise; the
-  EWMA/CUSUM ramp signals also fire on ordinary drifts. Tuning
-  `--zscore-threshold` / `--cusum-h` against these numbers is the obvious
-  next step for Objective 2.
-- The low tick-level precision (0.16) is mostly an artefact of first-tick
+Before the tuning (batch `35eae9d1`, previous detector defaults):
+
+| | Event P / R / F1 | Incident precision |
+|---|---|---|
+| Any anomaly | 0.78 / 0.72 / 0.75 | 0.72 (1,103 incidents) |
+| `wash_trade` | 0.94 / 0.99 / 0.96 | 0.81 |
+| `price_shock` | 0.34 / 0.43 / 0.38 | 0.48 |
+
+- **Wash trades are detected almost perfectly**: 591 of 595 events, and 94%
+  of wash-trade flags are inside a real wash-trade burst. Unchanged by the
+  tuning.
+- **Price shocks: recall 0.43 → 0.88, precision 0.34 → 0.50.** The injected
+  shocks are a 4–8 *tick*-sigma jump on one tick. The level Z-score (price
+  vs. a 20-tick window) dilutes that, and the price CUSUM, which measures
+  moves in tick sigmas, could not fire on a single step at its old alarm
+  level (h=6 with steps clipped at 5σ). With `--cusum-h 2.5` it fires on one
+  move above 4.5σ, and the Z-score and EWMA thresholds were raised (5 → 8,
+  2.75 → 4) to cut the false alarms they no longer need to cover.
+  Thresholds were chosen on the training split only, and hold on the test
+  split and on held-out ramp variants (`stream-processing/README.md`,
+  "Price-shock tuning"; `stream-processing/tune_price_shock.py`).
+- **Remaining price-shock false alarms**: half of `price_shock` flags fall
+  outside a shock window — mostly ordinary fast moves above 4.5σ in the
+  real price data. Ranking alerts by `risk_score` is the way to use them.
+- The low tick-level precision (0.22) is mostly an artefact of first-tick
   labelling: one event typically produces several flags on consecutive
-  ticks (4,157 flags for 1,103 incidents), and only one of them is the
+  ticks (4,274 flags for 1,335 incidents), and only one of them is the
   labeled tick. The incident grouping is what keeps the alert count close
   to the event count.
 
@@ -222,8 +238,6 @@ lets it resume without loss after a crash, but not without a pause.
 - **Recorded demo run**: 10–15 min of producer `--live` → detector →
   Cassandra → dashboard, with screenshots of the dashboard (KPI tiles,
   alerts, live chart) for the report.
-- **Price-shock tuning** (with Objective 2): the event-level numbers above
-  are the baseline to beat.
 
 ## Out of scope (per the proposal)
 

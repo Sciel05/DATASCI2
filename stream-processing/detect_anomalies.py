@@ -282,10 +282,10 @@ def make_baseline_update_fn(
     gap_reset_ms=30 * 60 * 1000,
     ewma_fast_span=3,
     ewma_slow_span=20,
-    ewma_threshold=2.75,
+    ewma_threshold=4.0,
     ewma_min_samples=50,
     cusum_k=2.0,
-    cusum_h=6.0,
+    cusum_h=2.5,
     cusum_volume_k=0.75,
     cusum_volume_h=3.0,
     cusum_sigma_span=100,
@@ -823,13 +823,14 @@ def parse_args(argv=None):
     ap.add_argument(
         "--zscore-threshold",
         type=float,
-        default=5.0,
-        help="Z-score is the informative signal here. A sweep (3.0-7.0 at "
-        "--baseline-window 20, see calibrate_thresholds.py and README.md) found F1 "
-        "peaks at z=5.5 (precision 19.7%%/recall 35.5%%); this defaults to 5.0 -- "
-        "F1 within 0.001 of the peak (precision 18.7%%/recall 39.4%%) but "
-        "recall-favoring, since false negatives are worse than false positives for "
-        "a surveillance use case.",
+        default=8.0,
+        help="Flag when |price - rolling mean| exceeds this many rolling standard "
+        "deviations. Was 5.0, when this level z-score was the only signal that could "
+        "catch a one-tick jump; with --cusum-h 2.5 the price CUSUM catches jumps "
+        "directly, and the z-score's remaining flags below ~8 were mostly false "
+        "alarms (tune_price_shock.py, training split; README.md). Kept at 8, about "
+        "the 99.9th percentile of |z| on normal ticks, so it still catches large "
+        "level dislocations.",
     )
     ap.add_argument(
         "--vwap-threshold",
@@ -893,16 +894,21 @@ def parse_args(argv=None):
                     help="Span (ticks) of the fast price EWMA for the ramp signal")
     ap.add_argument("--ewma-slow-span", type=float, default=20.0,
                     help="Span (ticks) of the slow price EWMA for the ramp signal")
-    ap.add_argument("--ewma-threshold", type=float, default=2.75,
-                    help="Flag when |fast - slow| exceeds this many RMS of the recent divergence")
+    ap.add_argument("--ewma-threshold", type=float, default=4.0,
+                    help="Flag when |fast - slow| exceeds this many RMS of the recent divergence "
+                    "(was 2.75; results are flat from 4 up, tune_price_shock.py)")
     ap.add_argument("--ewma-min-samples", type=int, default=50,
                     help="Ticks since the last reset before the ramp signal is scored")
 
     # CUSUM detectors
     ap.add_argument("--cusum-k", type=float, default=2.0,
                     help="Price CUSUM allowance per tick, in tick-sigma units")
-    ap.add_argument("--cusum-h", type=float, default=6.0,
-                    help="Price CUSUM alarm level, in tick-sigma units")
+    ap.add_argument("--cusum-h", type=float, default=2.5,
+                    help="Price CUSUM alarm level, in tick-sigma units. With --cusum-k 2 a "
+                    "single step above k + h = 4.5 sigma fires, matching the injected 4-8 "
+                    "sigma shocks; steps are clipped at --clip-k (5), so k + h must stay "
+                    "below it or a one-tick jump can never fire (the old h=6 couldn't). "
+                    "Chosen on the training split, tune_price_shock.py / README.md")
     ap.add_argument("--cusum-volume-k", type=float, default=0.75,
                     help="Volume CUSUM allowance per tick, in log-volume sd units")
     ap.add_argument("--cusum-volume-h", type=float, default=3.0,

@@ -68,7 +68,11 @@ Price signals (flag `anomaly_type = "price_shock"`):
   tick looks extreme. Scored after 50 ticks.
 - **Price CUSUM**: two-sided CUSUM of tick-to-tick price changes,
   standardized by a slow RMS of (clipped) changes; allowance k=2, alarm
-  h=6. Scored after 50 ticks. The side that fires restarts at zero.
+  h=2.5. Scored after 50 ticks. The side that fires restarts at zero.
+  With k + h = 4.5 below the 5-sigma step clip, a single move above 4.5
+  tick sigma fires it on its own: this is now the main price-shock
+  signal (see "Price-shock tuning" below; it was h=6, which no single
+  step could reach).
 
 Volume signals (flag `anomaly_type = "wash_trade"`):
 
@@ -94,12 +98,15 @@ Volume signals (flag `anomaly_type = "wash_trade"`):
   Catches the obvious large prints.
 
 Each CUSUM step is clipped to `--clip-k`, and the slow statistics update
-after scoring, so one shock can't carry a CUSUM alone. A CUSUM that
+after scoring, so one shock can't inflate the sigma the next ticks are
+measured against. (Since the price-shock tuning, one shock *can* fire the
+price CUSUM alone, by design; the volume CUSUM still needs several
+steps.) A CUSUM that
 fires restarts from zero on the next tick, so a burst raises one alarm
 per accumulation rather than one per tick.
 
 **Risk score and incidents.** Every signal is expressed as a multiple of
-its own alarm level (|z|/5, vwap_div/1%, |ewma_div|/2.75, CUSUM/h, tick
+its own alarm level (|z|/8, vwap_div/1%, |ewma_div|/4, CUSUM/h, tick
 volume / the wash rule's volume limit, tick volume / 6x typical volume);
 `risk_score` is the largest. A
 tick is flagged when `risk_score > --risk-threshold` (1.0, i.e. any
@@ -207,7 +214,61 @@ never across a session gap, scaled to each session's tick sigma:
 The held-out set is generated only with `--heldout`; no threshold was
 chosen while looking at it.
 
-### Final results (per event)
+### Price-shock tuning (2026-10-04; current defaults)
+
+`python tune_price_shock.py` (sweep, training split only) and
+`python tune_price_shock.py --check h=2.5,z=8.0,ewma=4.0 --heldout`.
+
+**Why price shocks were missed.** An injected shock is a 4-8 *tick*-sigma
+jump on one tick. The level Z-score compares the price to a 20-tick
+window whose spread is several tick sigmas, so the jump is diluted: on
+the labeled shock tick the median |z| was 3.9, and a quarter were below
+1.7, against |z| 4.0 at the 99th percentile of normal ticks. The price
+CUSUM measures exactly the right unit (each step is the move in tick
+sigmas), but with k=2 and h=6 a single step, clipped at 5 sigma, adds at
+most 3 < 6, so it could never fire on a one-tick jump (11 of 402 training
+shocks caught, all via accumulation).
+
+**What changed:** `--cusum-h` 6 -> **2.5** (fires on one step above
+k + h = 4.5 sigma), `--zscore-threshold` 5 -> **8**, `--ewma-threshold`
+2.75 -> **4**. Nothing else.
+
+**How it was chosen** (rule fixed before looking at test or held-out):
+stage 1 swept k in {1, 1.5, 2, 2.5} x h in {1.5 ... 6}, stage 2 z in
+{4.5 ... 15} x EWMA in {2.75 ... 6}, all on the **training split**, per
+event. A setting qualified only if no other type (wash_trade, shock_ramp,
+wash_split) lost more than 0.005 F1; among those, the highest mean F1 of
+the two price types (price_shock, shock_ramp), with z kept at most 8 so
+the level Z-score stays a live signal. Raising z further kept helping on
+train (0.75 at z=15) because, with the CUSUM catching jumps, the
+Z-score's remaining flags are mostly false alarms; switching a signal
+off on the strength of synthetic shocks would be overfitting, so it
+wasn't. EWMA results are flat from 4 up. k + h must stay below the
+5-sigma clip: k=2, h=3 can never fire on one step and falls back to
+0.406.
+
+| per event, P / R / F1 | before | **after: train** | **after: test** | after: all days |
+|---|---|---|---|---|
+| price_shock (original) | 36.1% / 42.9% / 0.392 | 58.5% / 86.6% / 0.698 | **52.5% / 89.9% / 0.663** | 56.4% / 87.6% / 0.686 |
+| wash_trade (original) | 93.7% / 99.2% / 0.963 | 0.963 | 0.966 | 93.6% / 99.3% / 0.964 |
+| shock_ramp (existing) | 32.2% / 16.5% / 0.218 | 0.333 | 0.406 | 42.1% / 30.8% / 0.356 |
+| wash_split (existing) | 89.3% / 73.3% / 0.805 | 0.792 | 0.830 | 0.804 |
+| **shock_ramp_long (held-out)** | 36.3% / 24.1% / 0.290 | 0.393 | **0.440** | 46.3% / 37.0% / 0.411 |
+| **wash_split_fine (held-out)** | 66.6% / 29.9% / 0.413 | 0.412 | 0.411 | 0.412 |
+| incident precision / alerts per ticker-hour | 72.0% / 6.8 | 75.7% / 8.1 | 75.5% / 8.6 | 75.7% / 8.2 |
+
+("before" is all days; its per-period values are in the tables below.)
+Price-shock recall roughly doubles and precision rises, out of sample as
+well as in; ramps improve too, including the held-out ramps; no wash type
+moves by more than 0.002. The cost is ~20% more alerts per hour, at a
+higher share of real ones. The Spark pipeline end to end (Cassandra
+sink, `evaluation/run_evaluation.py batch`) reproduces the 87.6%
+price-shock event recall exactly.
+
+The tables below describe the **previous defaults** (z=5, EWMA 2.75,
+h=6) and are kept as the record of earlier rounds.
+
+### Final results (per event; previous defaults)
 
 `python evaluate_generalization.py --heldout --naive [--period test]`.
 
@@ -447,7 +508,9 @@ sits on a broad plateau rather than a lucky point.
   ordinary one-sd trend. Every price-only ramp signal tried here
   (fast-vs-slow EWMA, price CUSUM, the rolling window against a slow
   EWMA) trades ramp recall directly against false alarms on normal
-  trending periods; ramp recall stays around 17-30%.
+  trending periods; ramp recall was 17-30% at the previous defaults and
+  is 31-43% after the price-shock tuning (all days / test, held-out
+  ramps included), still the weakest type.
 - **The price CUSUM (k=2, h=6) was a small regression on the original
   shocks when added** (price_shock F1 0.378 -> 0.374, per event, existing
   variants), traded for ramp F1 0.183 -> 0.225. At lower allowances
@@ -726,3 +789,15 @@ per-event and per-incident scores on the harder variants — produces the
 evaluation tables above (~2-3 min, pandas only). Tune with
 `--period train` only; `--period test` and `--heldout` are for final
 scoring.
+
+### Price-shock threshold sweep
+
+```bash
+python tune_price_shock.py                                      # sweep, train only (~4 min)
+python tune_price_shock.py --check h=2.5,z=8.0,ewma=4.0 --heldout  # one setting vs defaults
+```
+
+Runs section 4 of `evaluate_generalization.py` for every setting in
+parallel (`--workers`, default 4) and prints per-event F1 per type,
+incident precision and alerts per hour; produces the "Price-shock tuning"
+table. Needs pyspark importable (the Docker `pyspark` container).
